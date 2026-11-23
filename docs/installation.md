@@ -1,5 +1,8 @@
 # Installation
 
+For the authenticated fork, follow [Local session setup](local-session.md).
+The installation instructions below describe upstream v1.0.2.
+
 Two pieces need to be installed: a **Blender addon** and a **UEFN Python script**.
 They talk to each other over `localhost` HTTP, so both apps must run on the
 same machine.

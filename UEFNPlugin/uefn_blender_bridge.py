@@ -14,14 +14,13 @@ github.com/KiKoZl1 | Surprise Co. (surpriseugc.com)
 
 import unreal
 import hashlib
-import io
+import hmac
 import json
 import math
 import os
+from pathlib import Path
 import queue
-import socket
-import sys
-import tempfile
+import re
 import threading
 import time
 import traceback
@@ -37,6 +36,7 @@ PLUGIN_VERSION = "1.0.2"
 DEFAULT_PORT = 8790
 MAX_PORT = 8795
 TICK_BATCH = 5
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
 HTTP_TIMEOUT = 600.0   # UEFN-side do_POST deadline; a heavy textured import can take minutes and
                        # the UEFN import pipeline is single-threaded, so a short deadline 504'd mid-import
                        # (Blender already waits 600s on the send). Must be >= the Blender send timeout.
@@ -62,6 +62,7 @@ _responses_lock = threading.Lock()
 _req_counter = 0
 
 _project_path = ""
+_world_path = ""
 _bridge_project = ""       # project name from Blender (folder under BlenderBridge/)
 _blender_server_port = 0   # Blender's HTTP server port for bidirectional sync
 _last_push_snapshot = {}   # {obj_name: "loc|rot|scale" hash} for diff-based push
@@ -76,6 +77,76 @@ _last_import = 0.0
 _total_imports = 0
 _log_ring = []
 _gui = None
+_session_dir = None
+_exchange_dir = None
+_session_token = None
+
+
+def _load_session():
+    global _session_dir, _exchange_dir, _session_token
+    configured = os.environ.get("UEFN_BLENDER_BRIDGE_SESSION_DIR")
+    if not configured:
+        raise RuntimeError("Set UEFN_BLENDER_BRIDGE_SESSION_DIR before starting the bridge.")
+    _session_dir = Path(configured).resolve(strict=True)
+    if not _session_dir.is_dir():
+        raise RuntimeError("Bridge session path must be a directory.")
+    _exchange_dir = (_session_dir / "exchange").resolve(strict=True)
+    token_path = (_session_dir / "session_token").resolve(strict=True)
+    if (_exchange_dir.parent != _session_dir or not _exchange_dir.is_dir()
+            or token_path.parent != _session_dir or not token_path.is_file()):
+        raise RuntimeError("Bridge exchange and session token must be inside the session directory.")
+    if token_path.stat().st_size > 128:
+        raise RuntimeError("Invalid bridge session token.")
+    _session_token = token_path.read_text(encoding="utf-8-sig").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", _session_token):
+        raise RuntimeError("Bridge session token must contain 64 hex characters.")
+
+
+def _exchange_path(value, suffixes=(), directory=False):
+    if not isinstance(value, (str, os.PathLike)) or not value:
+        raise ValueError("A bridge exchange path is required.")
+    raw = Path(value)
+    if not raw.is_absolute():
+        raise ValueError("Bridge exchange paths must be absolute.")
+    path = raw.resolve(strict=True)
+    if not path.is_relative_to(_exchange_dir):
+        raise ValueError("Bridge paths must stay inside the session exchange directory.")
+    if directory:
+        if not path.is_dir():
+            raise ValueError("Bridge exchange folder is not a directory.")
+    elif not path.is_file() or path.suffix.lower() not in suffixes:
+        raise ValueError("Unexpected file type in the bridge exchange directory.")
+    return str(path)
+
+
+_TEXTURE_SUFFIXES = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tiff", ".exr")
+
+
+def _read_material_manifest(exchange_folder):
+    folder = _exchange_path(exchange_folder, directory=True)
+    manifest = Path(folder) / "materials.json"
+    if not manifest.exists():
+        return []
+    path = Path(_exchange_path(manifest, (".json",)))
+    if path.stat().st_size > MAX_REQUEST_BYTES:
+        raise ValueError("Bridge material manifest is too large.")
+    with path.open("r", encoding="utf-8-sig") as handle:
+        entries = json.load(handle)
+    if not isinstance(entries, list):
+        raise ValueError("Bridge material manifest must contain a list.")
+    for entry in entries:
+        for texture in (entry.get("textures") or {}).values():
+            if texture.get("path"):
+                texture["path"] = _exchange_path(texture["path"], _TEXTURE_SUFFIXES)
+    return entries
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_loopback_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 # ============================================================
 # CHANNEL MAP
@@ -210,16 +281,22 @@ def _asset_lib():
 
 
 def _detect_project_path():
-    global _project_path
-    try:
-        world = unreal.get_editor_subsystem(
-            unreal.UnrealEditorSubsystem).get_editor_world()
-        wp = world.get_path_name()
-        _project_path = "/" + wp.split("/")[1]
-        _log(f"Project path: {_project_path}")
-    except Exception:
-        _project_path = "/Game"
-        _log("Could not detect project path, using /Game", "warning")
+    global _project_path, _world_path
+    _world_path = _current_world_path()
+    if not _world_path.startswith("/") or _world_path.count("/") < 2:
+        raise RuntimeError("Open the target project and level before starting the bridge.")
+    _project_path = "/" + _world_path.split("/")[1]
+    _log(f"Project path: {_project_path}")
+
+
+def _current_world_path():
+    world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    return world.get_path_name() if world else ""
+
+
+def _check_world():
+    if not _world_path or _current_world_path() != _world_path:
+        raise RuntimeError("The original bridge level is no longer open. Restart the bridge for this level.")
 
 
 def _detect_channel(filename):
@@ -311,7 +388,7 @@ def _config_tex(path, ch):
 # FBX IMPORT
 # ============================================================
 
-def _import_fbx(fbx_path, dest_path, combine=False):
+def _import_fbx(fbx_path, dest_path, combine=False, existing_name=None):
     if not os.path.exists(fbx_path):
         _log(f"FBX not found: {fbx_path}", "error")
         return []
@@ -321,10 +398,14 @@ def _import_fbx(fbx_path, dest_path, combine=False):
     task = unreal.AssetImportTask()
     task.set_editor_property("filename", fbx_path)
     task.set_editor_property("destination_path", dest_path)
-    task.set_editor_property("destination_name", "")
+    task.set_editor_property("destination_name", existing_name or "")
     task.set_editor_property("replace_existing", True)
+    task.set_editor_property("replace_existing_settings", False)
     task.set_editor_property("automated", True)
-    task.set_editor_property("save", True)
+    task.set_editor_property("save", existing_name is None)
+    if existing_name:
+        # In-place update needs a factory that respects destination_name.
+        task.set_editor_property("factory", unreal.FbxFactory())
 
     options = unreal.FbxImportUI()
     options.set_editor_property("import_mesh", True)
@@ -359,7 +440,7 @@ def _import_fbx(fbx_path, dest_path, combine=False):
     except Exception:
         pass
 
-    if not imported:
+    if not imported and not existing_name:
         try:
             reg = unreal.AssetRegistryHelpers.get_asset_registry()
             for ad in reg.get_assets_by_path(dest_path, recursive=True):
@@ -378,25 +459,51 @@ def _import_fbx(fbx_path, dest_path, combine=False):
 
 
 
-def _find_actor_by_label(asub, label):
-    for a in asub.get_all_level_actors():
-        try:
-            if a.get_actor_label() == label:
-                return a
-        except Exception:
-            pass
-    return None
+def _actor_guid(actor):
+    if not _bridge_project:
+        return None
+    tags = [str(tag) for tag in actor.tags]
+    project_tags = [tag for tag in tags if tag.startswith("BB_PROJECT:")]
+    if project_tags != [f"BB_PROJECT:{_bridge_project}"]:
+        return None
+    guids = [tag.removeprefix("BB_GUID:") for tag in tags if tag.startswith("BB_GUID:")]
+    if len(guids) != 1 or not re.fullmatch(r"[0-9a-f]{32}", guids[0]):
+        return None
+    return guids[0]
+
+
+def _owned_actors(asub):
+    by_guid = {}
+    for actor in asub.get_all_level_actors():
+        guid = _actor_guid(actor)
+        if guid:
+            if guid in by_guid:
+                raise ValueError("Duplicate actor GUID in the current bridge project.")
+            by_guid[guid] = actor
+    return by_guid
+
+
+def _validated_objects(objects):
+    if not _bridge_project or not isinstance(objects, list) or not objects:
+        raise ValueError("Connect from Blender and provide mesh objects with stable GUIDs.")
+    seen = set()
+    for entry in objects:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
+            raise ValueError("Every bridge mesh object must have a name.")
+        guid = entry.get("guid", "")
+        if not isinstance(guid, str) or not re.fullmatch(r"[0-9a-f]{32}", guid) or guid in seen:
+            raise ValueError("Bridge objects must have unique 32-character lowercase GUIDs.")
+        for field in ("location", "rotation", "scale"):
+            values = entry.get(field)
+            if (not isinstance(values, list) or len(values) != 3
+                    or not all(type(value) in (int, float) and math.isfinite(value) for value in values)):
+                raise ValueError(f"Bridge object {entry['name']} has invalid {field}.")
+        seen.add(guid)
+    return objects
 
 
 def _find_actor_by_guid(asub, guid):
-    needle = f"BB_GUID:{guid}"
-    for a in asub.get_all_level_actors():
-        try:
-            if any(str(t) == needle for t in a.tags):
-                return a
-        except Exception:
-            pass
-    return None
+    return _owned_actors(asub).get(guid)
 
 
 def _ensure_sm_name(asset, base, dest_folder=None):
@@ -410,14 +517,9 @@ def _ensure_sm_name(asset, base, dest_folder=None):
         new_pkg = f"{folder}/SM_{base}"
         if new_pkg == pkg:
             return asset
-        # Already named at destination (prior send) — reuse it, drop the staging duplicate.
+        # An imported mesh with a conflicting final path requires a targeted reimport.
         if _asset_lib().does_asset_exist(new_pkg):
-            if pkg != new_pkg:
-                try:
-                    _asset_lib().delete_asset(pkg)
-                except Exception:
-                    pass
-            return _asset_lib().load_asset(new_pkg) or asset
+            raise ValueError(f"Bridge mesh already exists at {new_pkg}.")
         ok = False
         try:
             ok = _asset_lib().rename_asset(pkg, new_pkg)
@@ -428,36 +530,32 @@ def _ensure_sm_name(asset, base, dest_folder=None):
             if moved:
                 _log(f"  named SM_{base} @ {folder}")
                 return moved
-        _log(f"  SM_ rename FAILED: {cur} -> {new_pkg}", "warning")
+        raise RuntimeError(f"Cannot move bridge mesh to {new_pkg}.")
     except Exception as e:
-        _log(f"  SM_ route error for {base}: {e}", "warning")
-    return asset
+        raise RuntimeError(f"Cannot route bridge mesh {base}: {e}") from e
 
 
 def _spawn_or_reuse(asub, asset, label, guid):
-    """Reuse an existing bridge actor (by GUID, then label) or spawn a new one — idempotent (B3).
-    Points it at `asset` and stamps the label + GUID tag. Returns the actor (or None on failure)."""
-    existing = (_find_actor_by_guid(asub, guid) if guid else None) \
-        or _find_actor_by_label(asub, label)
+    """Match only bridge-owned actor IDs and preserve existing editor tags."""
+    if not _bridge_project or not re.fullmatch(r"[0-9a-f]{32}", guid):
+        raise ValueError("Bridge actor requires project ownership and a unique GUID.")
+    existing = _find_actor_by_guid(asub, guid)
     if existing:
         comp = existing.static_mesh_component
-        if comp:
+        if not comp:
+            raise ValueError("Bridge actor does not have a static mesh component.")
+        if comp.get_editor_property("static_mesh") != asset:
             comp.set_static_mesh(asset)
-        actor = existing
-    else:
-        actor = asub.spawn_actor_from_object(asset, unreal.Vector(0, 0, 0))
-        if not actor:
-            _log(f"  Spawn failed: {label}", "warning")
-            return None
+        return existing
+    actor = asub.spawn_actor_from_object(asset, unreal.Vector(0, 0, 0))
+    if not actor:
+        _log(f"  Spawn failed: {label}", "warning")
+        return None
     actor.set_actor_label(label)
-    # Stamp identity tags: GUID (per-object identity) + PROJECT (reliable clean scoping — the
-    # Outliner folder path isn't readable via get_folder_path() in this UEFN build).
-    tags = []
-    if guid:
-        tags.append(unreal.Name(f"BB_GUID:{guid}"))
-    if _bridge_project:
-        tags.append(unreal.Name(f"BB_PROJECT:{_bridge_project}"))
-    actor.tags = tags
+    actor.tags = list(actor.tags) + [
+        unreal.Name(f"BB_GUID:{guid}"),
+        unreal.Name(f"BB_PROJECT:{_bridge_project}"),
+    ]
     return actor
 
 
@@ -534,17 +632,6 @@ def _place_meshes(asset_paths, object_data=None, scene_name="Scene"):
             return next(iter(mesh_by_name.items()))
         return None, None
 
-    if not object_data:
-        # Legacy fallback: one actor per imported mesh.
-        for name, asset in list(mesh_by_name.items()):
-            asset = _ensure_sm_name(asset, name, _mesh_dir())
-            actor = _spawn_or_reuse(asub, asset, f"{ACTOR_PREFIX}{name}", "")
-            if actor:
-                actor.set_folder_path(_outliner_folder())
-                actors.append(actor)
-        _log(f"Placed {len(actors)} actor(s)")
-        return actors
-
     renamed = {}  # mesh key -> StaticMesh after SM_/collection rename (once per shared mesh)
     for od in object_data:
         try:
@@ -584,73 +671,6 @@ def _place_meshes(asset_paths, object_data=None, scene_name="Scene"):
 # ============================================================
 # CLEANUP
 # ============================================================
-
-def _cleanup_actors(names=None):
-    """Remove this bridge PROJECT's actors only — reliably scoped. `get_folder_path()` is NOT
-    exposed in this UEFN build (it returns nothing), which made the old folder-scope match ZERO
-    actors: clean then deleted the assets but left the actors behind, mesh-less, in the Outliner.
-    We now scope by, in order:
-      1. the BB_PROJECT:<project> tag stamped at placement (always readable);
-      2. the actor's StaticMesh living under this project's folder (covers actors placed before
-         tags existed);
-      3. an orphaned bridge actor (BB_ label, mesh already deleted) NOT tagged to another project
-         — junk left by a prior clean; we sweep it so nothing lingers mesh-less.
-    Never touches another .blend project's actors."""
-    asub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-    base = _base_dir()
-    proj_tag = f"BB_PROJECT:{_bridge_project}" if _bridge_project else ""
-    to_remove = []
-    for actor in asub.get_all_level_actors():
-        label = actor.get_actor_label()
-        if not label or not label.startswith(ACTOR_PREFIX):
-            continue
-        tags = [str(t) for t in (actor.tags or [])]
-        mine = False
-        if proj_tag and proj_tag in tags:
-            mine = True
-        else:
-            try:
-                comp = actor.static_mesh_component
-                sm = comp.get_editor_property("static_mesh") if comp else None
-            except Exception:
-                sm = None
-            if sm is not None:
-                try:
-                    mine = str(sm.get_path_name()).startswith(base)
-                except Exception:
-                    mine = False
-            else:
-                # Orphan (no mesh): ONLY ours if it carries a bridge tag (every bridge actor gets a
-                # BB_GUID tag at placement). NEVER delete a BB_-named actor the USER created (a
-                # light/trigger/blueprint they happened to name "BB_*") — it has no bridge tag.
-                # Also skip anything tagged to a different project.
-                has_bridge_tag = any(t.startswith("BB_GUID:") or t.startswith("BB_PROJECT:") for t in tags)
-                other_project = any(t.startswith("BB_PROJECT:") and t != proj_tag for t in tags)
-                mine = has_bridge_tag and not other_project
-        if not mine:
-            continue
-        if names:
-            if label[len(ACTOR_PREFIX):] in names:
-                to_remove.append(actor)
-        else:
-            to_remove.append(actor)
-
-    if to_remove:
-        asub.destroy_actors(to_remove)
-        _log(f"Cleaned {len(to_remove)} actor(s)")
-    return len(to_remove)
-
-
-def _cleanup_assets(dest):
-    try:
-        if _asset_lib().does_directory_exist(dest):
-            for a in _asset_lib().list_assets(dest, recursive=True):
-                try:
-                    _asset_lib().delete_asset(str(a))
-                except Exception:
-                    pass
-    except Exception:
-        pass
 
 # ============================================================
 # PBR MATERIAL CREATION
@@ -940,13 +960,8 @@ def _apply_materials(obj_data, exchange_folder):
     Materials/<collection>/{M_,MI_}<mat>. A material shared by N meshes => ONE MI_ reused."""
     if not obj_data or not exchange_folder:
         return {}
-    mat_json = os.path.join(exchange_folder, "materials.json")
-    if not os.path.exists(mat_json):
-        _log(f"  MAT: materials.json NOT FOUND at {mat_json}", "warning")
-        return {}
     try:
-        with open(mat_json, "r") as f:
-            mat_list = json.load(f)
+        mat_list = _read_material_manifest(exchange_folder)
     except Exception as e:
         _log(f"  MAT: materials.json read failed: {e}", "warning")
         return {}
@@ -1039,9 +1054,7 @@ def _apply_materials(obj_data, exchange_folder):
     sm_done = set()
     for od in obj_data:
         guid = od.get("guid", "")
-        label = f"{ACTOR_PREFIX}{od.get('name', '')}"
-        actor = (_find_actor_by_guid(asub, guid) if guid else None) \
-            or _find_actor_by_label(asub, label)
+        actor = _find_actor_by_guid(asub, guid)
         comp = actor.static_mesh_component if actor else None
         if not comp:
             continue
@@ -1077,30 +1090,6 @@ def _apply_materials(obj_data, exchange_folder):
     _log(f"Materials: {len(mi_by_mat)} unique (master+MI), {assigned} slot(s) assigned")
     return mi_by_mat
 
-
-def _clean_staging(folder):
-    """Remove leftover NON-mesh assets from the import staging folder (the embed auto-materials,
-    now unreferenced after MI_ took over the StaticMesh), then drop the folder if it holds no
-    StaticMesh. NEVER deletes a StaticMesh (safety)."""
-    try:
-        if not _asset_lib().does_directory_exist(folder):
-            return
-        assets = list(_asset_lib().list_assets(folder, recursive=True))
-        meshes = [a for a in assets if "StaticMesh" in _asset_class(a)]
-        if not meshes:
-            # Common case (SM already moved out): one delete_directory is far faster than
-            # deleting asset-by-asset (the per-asset path was the ~18s bottleneck).
-            _asset_lib().delete_directory(folder)
-        else:
-            for a in assets:
-                if a not in meshes:
-                    try:
-                        _asset_lib().delete_asset(str(a))
-                    except Exception:
-                        pass
-        _log(f"  Cleaned staging: {folder}")
-    except Exception as e:
-        _log(f"  Staging cleanup skipped: {e}", "warning")
 
 # ============================================================
 # IMPORT TEXTURES + CREATE MATERIALS
@@ -1147,9 +1136,7 @@ def _process_textures(tex_folder, scene_name, tex_dest=None, mat_dest=None):
     for sn, channels in tex_sets.items():
         tex_paths = {}
         for ch, fname in channels.items():
-            fp = os.path.join(tex_folder, fname)
-            if not os.path.isfile(fp):
-                continue
+            fp = _exchange_path(Path(tex_folder) / fname, _TEXTURE_SUFFIXES)
             aname = _sanitize_seg(f"T_{scene_name}_{os.path.splitext(fname)[0]}")
             ap = _import_tex(fp, tex_dest, aname)
             if ap:
@@ -1190,6 +1177,22 @@ def _dispatch(cmd, par):
     h = _HANDLERS.get(cmd)
     if not h:
         raise ValueError(f"Unknown command: {cmd}")
+    if cmd not in {"ping", "get_status", "get_log", "blender_disconnect"}:
+        _check_world()
+    if cmd in {"import_scene", "add_objects", "update_objects", "update_textures"}:
+        par = dict(par)
+        if par.get("exchange_folder"):
+            par["exchange_folder"] = _exchange_path(par["exchange_folder"], directory=True)
+            _read_material_manifest(par["exchange_folder"])
+        if par.get("fbx_path"):
+            par["fbx_path"] = _exchange_path(par["fbx_path"], (".fbx",))
+        if par.get("fbx_paths"):
+            par["fbx_paths"] = {
+                key: _exchange_path(value, (".fbx",))
+                for key, value in par["fbx_paths"].items()
+            }
+        # This name is sometimes used as an asset path segment.
+        par["scene_name"] = _sanitize_seg(par.get("scene_name", "Scene"))
     return h(**par)
 
 
@@ -1230,6 +1233,8 @@ def _blender_connect(blender_version="", addon_version="", project_name="",
     # (a space/dot would break it). This is the BLENDER project, not the UEFN project.
     _bridge_project = _sanitize_seg(project_name.strip()) or "Default"
     _blender_server_port = int(server_port) if server_port else 0
+    if not 0 <= _blender_server_port <= 65535:
+        raise ValueError("Invalid Blender callback port.")
     _blender_info = {
         "version": blender_version,
         "addon_version": addon_version,
@@ -1243,8 +1248,9 @@ def _blender_connect(blender_version="", addon_version="", project_name="",
     _log(f"  Meshes:    {_mesh_dir()}")
     _log(f"  Materials: {_mat_dir()}")
     _log(f"  Textures:  {_tex_dir()}")
+    owned = _owned_actors(unreal.get_editor_subsystem(unreal.EditorActorSubsystem))
     return {"status": "ok", "project_path": _project_path,
-            "bridge_project": _bridge_project}
+            "bridge_project": _bridge_project, "guids": sorted(owned)}
 
 
 @_reg("blender_disconnect")
@@ -1266,16 +1272,15 @@ def _import_scene_cmd(fbx_path="", scene_name="Scene", objects=None,
     mesh_dest = _mesh_dir(scene_name)
     mat_dest = _mat_dir(scene_name)
     tex_dest = _tex_dir(scene_name)
-    obj_data = objects or []
-    incoming_names = [o.get("name", "") for o in obj_data]
+    obj_data = _validated_objects(objects)
+    owned = _owned_actors(unreal.get_editor_subsystem(unreal.EditorActorSubsystem))
+    if any(od["guid"] in owned for od in obj_data):
+        raise ValueError("These actors already exist. Use incremental sync to update them in place.")
 
     if not fbx_path or not os.path.exists(fbx_path):
         _log(f"FBX not found: {fbx_path}", "error")
         return {"success": False, "error": "FBX not found"}
 
-    mat_count = 0
-
-    # Import FBX FIRST, before cleaning old actors
     imported = _import_fbx(fbx_path, mesh_dest, combine_meshes)
     mesh_paths = []
     for p in imported:
@@ -1292,55 +1297,16 @@ def _import_scene_cmd(fbx_path="", scene_name="Scene", objects=None,
             except Exception:
                 pass
 
-    # Nuclear fallback: scan mesh folder if nothing found
-    if not mesh_paths:
-        _log("  No meshes from paths, scanning folder...")
-        try:
-            reg = unreal.AssetRegistryHelpers.get_asset_registry()
-            for ad in reg.get_assets_by_path(mesh_dest, recursive=True):
-                cls = str(ad.asset_class_path.asset_name) if hasattr(ad, "asset_class_path") else ""
-                if "StaticMesh" in cls:
-                    mesh_paths.append(str(ad.get_asset().get_path_name()))
-        except Exception:
-            pass
-        if not mesh_paths:
-            # Last resort: load every asset in folder
-            try:
-                for a in _asset_lib().list_assets(mesh_dest, recursive=True):
-                    try:
-                        asset = unreal.load_asset(str(a))
-                        if asset and isinstance(asset, unreal.StaticMesh):
-                            mesh_paths.append(str(a))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        _log(f"  Folder scan found: {len(mesh_paths)} mesh(es)")
-
     _log(f"  Meshes: {len(mesh_paths)} of {len(imported)} imported")
 
-    # Only clean old actors AFTER confirming new meshes are valid
     if not mesh_paths:
-        _log("  No valid meshes — keeping existing actors", "warning")
         return {"success": False, "error": "Import produced no valid meshes",
                 "actors": 0, "meshes": 0, "materials": 0}
-
-    # Safe to clean now — we have valid replacements
-    if selected_only:
-        _cleanup_actors(set(incoming_names))
-    else:
-        _cleanup_actors()
-
-    # Place meshes
     actors = _place_meshes(mesh_paths, obj_data, scene_name)
 
     # Build/assign per-material MM_/MI_ (deduped) in Materials/<collection>. The FBX import no
     # longer brings embed materials, so MI_ is the sole material source (shared textured masters).
     mat_map = _apply_materials(obj_data, exchange_folder)
-
-    # Staging now holds only StaticMeshes (no embed orphans) — meshes move to their collection
-    # folders, so this is a fast no-op / empty-folder drop, not the old ~3-min asset-by-asset purge.
-    _clean_staging(mesh_dest)
 
     _imported_scenes[scene_name] = {
         "actors": len(actors),
@@ -1353,6 +1319,8 @@ def _import_scene_cmd(fbx_path="", scene_name="Scene", objects=None,
     _total_imports += 1
 
     _log(f"IMPORT COMPLETE: {len(actors)} actor(s), {len(mat_map)} material(s)")
+    if len(actors) != len(obj_data):
+        raise RuntimeError(f"Placed {len(actors)} of {len(obj_data)} bridge actors.")
     return {
         "success": True,
         "actors": len(actors),
@@ -1361,118 +1329,16 @@ def _import_scene_cmd(fbx_path="", scene_name="Scene", objects=None,
     }
 
 
-@_reg("import_baked")
-def _import_baked_cmd(fbx_path="", scene_name="Scene", objects=None,
-                      exchange_folder="", combine_meshes=True, **kw):
-    global _last_import, _total_imports
-
-    _log(f"BAKED IMPORT: {scene_name}")
-
-    mesh_dest = _mesh_dir(scene_name)
-    mat_dest = _mat_dir(scene_name)
-    tex_dest = _tex_dir(scene_name)
-    obj_data = objects or []
-
-    # Full cleanup
-    _cleanup_actors()
-    _cleanup_assets(mesh_dest)
-    _cleanup_assets(mat_dest)
-    _cleanup_assets(tex_dest)
-
-    if not fbx_path or not os.path.exists(fbx_path):
-        _log(f"FBX not found: {fbx_path}", "error")
-        return {"success": False, "error": "FBX not found"}
-
-    # Import baked textures and create PBR materials
-    tex_folder = os.path.join(exchange_folder, "textures") if exchange_folder else ""
-    created_mats = {}
-    if tex_folder and os.path.isdir(tex_folder):
-        created_mats = _process_textures(tex_folder, scene_name, tex_dest, mat_dest)
-
-    # Import FBX
-    imported = _import_fbx(fbx_path, mesh_dest, combine_meshes)
-    mesh_paths = []
-    for p in imported:
-        cls = _asset_class(p)
-        if "StaticMesh" in cls:
-            mesh_paths.append(p)
-        else:
-            try:
-                asset = unreal.load_asset(str(p))
-                if asset and isinstance(asset, unreal.StaticMesh):
-                    mesh_paths.append(p)
-                    _log(f"  Fallback matched: {p}")
-            except Exception:
-                pass
-    _log(f"  Meshes found: {len(mesh_paths)} of {len(imported)} imported")
-
-    # Clean FBX-imported materials (we use our PBR ones)
-    for p in imported:
-        cls = _asset_class(p)
-        if "Material" in cls and "Instance" not in cls:
-            try:
-                _asset_lib().delete_asset(p)
-            except Exception:
-                pass
-
-    # Place meshes
-    actors = _place_meshes(mesh_paths, obj_data, scene_name)
-
-    # Materials come from the FBX import itself (embed_textures=True on the Blender side
-    # → UEFN auto-builds a PBR material per mesh, reused by name). We intentionally do NOT
-    # override that with a single material here (that was the "first material on all" bug).
-
-    _imported_scenes[scene_name] = {
-        "actors": len(actors),
-        "meshes": len(mesh_paths),
-        "materials": created_mats,
-        "time": time.time(),
-        "baked": True,
-    }
-    _last_import = time.time()
-    _total_imports += 1
-
-    _log(f"BAKED IMPORT COMPLETE: {len(actors)} actor(s), {len(created_mats)} material(s)")
-    return {
-        "success": True,
-        "actors": len(actors),
-        "meshes": len(mesh_paths),
-        "materials": len(created_mats),
-    }
-
-
 @_reg("update_transforms")
 def _update_transforms_cmd(objects=None, **kw):
-    if not objects:
-        return {"updated": 0}
-
     asub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
-    actors_map = {}
-    for actor in asub.get_all_level_actors():
-        label = actor.get_actor_label()
-        if label and label.startswith(ACTOR_PREFIX):
-            actors_map[label[len(ACTOR_PREFIX):]] = actor
-
+    actors_map = _owned_actors(asub)
     updated = 0
-    for od in objects:
-        name = od.get("name", "")
-        actor = actors_map.get(name)
+    for od in _validated_objects(objects):
+        actor = actors_map.get(od["guid"])
         if not actor:
             continue
-
-        loc = od.get("location", [0, 0, 0])
-        rot = od.get("rotation", [0, 0, 0])
-        scale = od.get("scale", [1, 1, 1])
-
-        actor.set_actor_location(
-            unreal.Vector(loc[0], loc[1], loc[2]), False, False)
-        actor.set_actor_rotation(
-            unreal.Rotator(pitch=rot[0], yaw=rot[1], roll=rot[2]), False)
-        actor.set_actor_scale3d(unreal.Vector(scale[0], scale[1], scale[2]))
-
-        # Update folder: /BlenderBridge/<project>/<collection> (mirrors the Content Browser)
-        actor.set_folder_path(_outliner_folder(od.get("collection", "")))
-
+        _apply_obj_transform(actor, od)
         updated += 1
 
     return {"updated": updated}
@@ -1486,7 +1352,10 @@ def _add_objects_cmd(fbx_paths=None, objects=None, scene_name="Scene",
         return {"added": 0}
 
     mesh_dest = _mesh_dir(scene_name)
-    obj_data = objects or []
+    obj_data = _validated_objects(objects)
+    owned = _owned_actors(unreal.get_editor_subsystem(unreal.EditorActorSubsystem))
+    if any(od["guid"] in owned for od in obj_data):
+        raise ValueError("Add Objects cannot overwrite existing bridge actors.")
 
     # Import each rep mesh FBX (one per unique datablock), collect all StaticMeshes, then place
     # ALL objects together so instances can reference a shared mesh (object-driven — F-44).
@@ -1503,52 +1372,56 @@ def _add_objects_cmd(fbx_paths=None, objects=None, scene_name="Scene",
         return {"added": 0}
 
     actors = _place_meshes(all_mesh_paths, obj_data, scene_name)
+    if len(actors) != len(obj_data):
+        raise RuntimeError(f"Placed {len(actors)} of {len(obj_data)} requested bridge actors.")
+    materials = _apply_materials(obj_data, exchange_folder)
+    if materials:
+        _imported_scenes.setdefault(scene_name, {}).setdefault("materials", {}).update(materials)
     _log(f"Added {len(actors)} object(s)")
     return {"added": len(actors)}
-
-
-@_reg("remove_objects")
-def _remove_objects_cmd(names=None, **kw):
-    """Remove specific actors by name."""
-    if not names:
-        return {"removed": 0}
-
-    count = _cleanup_actors(set(names))
-    _log(f"Removed {count} object(s): {names}")
-    return {"removed": count}
 
 
 @_reg("update_objects")
 def _update_objects_cmd(fbx_paths=None, objects=None, scene_name="Scene",
                         exchange_folder="", **kw):
-    """Update specific objects — remove old actors, import new FBX, place new actors."""
+    """Refresh bridge-owned mesh packages while retaining all placed actors."""
     if not fbx_paths:
         return {"updated": 0}
 
-    mesh_dest = _mesh_dir(scene_name)
-    obj_data = objects or []
+    obj_data = _validated_objects(objects)
+    owned = _owned_actors(unreal.get_editor_subsystem(unreal.EditorActorSubsystem))
+    mesh_root = _mesh_dir() + "/"
+    targets = {}
+    for od in obj_data:
+        actor = owned.get(od["guid"])
+        component = actor.get_component_by_class(unreal.StaticMeshComponent) if actor else None
+        asset = component.get_editor_property("static_mesh") if component else None
+        if not isinstance(asset, unreal.StaticMesh):
+            raise ValueError("An incremental geometry update requires an existing bridge mesh actor.")
+        package = asset.get_path_name().split(".")[0]
+        if not package.startswith(mesh_root):
+            raise ValueError("Cannot update a mesh outside the current bridge project's mesh folder.")
+        key = od.get("mesh", od.get("name", ""))
+        if key not in fbx_paths:
+            raise ValueError(f"No new FBX for bridge mesh {key}.")
+        if key in targets and targets[key] != package:
+            raise ValueError(f"Bridge instances have inconsistent mesh assignments for {key}.")
+        targets[key] = package
+    if set(targets) != set(fbx_paths) or len(set(targets.values())) != len(targets):
+        raise ValueError("Incremental updates need one source FBX per destination mesh.")
 
-    # Remove old actors for ALL objects being updated (not just the rep FBX names) — actors are
-    # labeled by object name, and instances share a rep FBX.
-    names_to_update = [od.get("name", "") for od in obj_data] or list(fbx_paths.keys())
-    _cleanup_actors(set(n for n in names_to_update if n))
+    for key, package in targets.items():
+        dest, name = package.rsplit("/", 1)
+        reported = {str(path).split(".")[0] for path in
+                    _import_fbx(fbx_paths[key], dest, combine=True, existing_name=name)}
+        if reported != {package} or not isinstance(unreal.load_asset(package), unreal.StaticMesh):
+            raise RuntimeError(f"FBX did not reimport into the expected bridge mesh {package}.")
+        if not _asset_lib().save_asset(package):
+            raise RuntimeError(f"Cannot save updated bridge mesh {package}.")
 
-    # Re-import each rep mesh, then re-place ALL objects together (object-driven — F-44).
-    all_mesh_paths = []
-    for obj_name, fbx_path in fbx_paths.items():
-        if not os.path.exists(fbx_path):
-            _log(f"  FBX not found for {obj_name}: {fbx_path}", "warning")
-            continue
-        imported = _import_fbx(fbx_path, mesh_dest, combine=False)
-        all_mesh_paths += [p for p in imported if "StaticMesh" in _asset_class(p)]
-
-    if not all_mesh_paths:
-        _log("  No meshes imported", "warning")
-        return {"updated": 0}
-
-    actors = _place_meshes(all_mesh_paths, obj_data, scene_name)
-    _log(f"Updated {len(actors)} object(s)")
-    return {"updated": len(actors)}
+    # Importing into the same asset package retains actor identity and instance references.
+    _log(f"Reimported {len(targets)} bridge mesh(es) in place")
+    return {"updated": len(obj_data), "meshes": len(targets)}
 
 
 @_reg("update_materials")
@@ -1559,7 +1432,7 @@ def _update_materials_cmd(materials=None, **kw):
 
     asub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     actors_map = {}
-    for actor in asub.get_all_level_actors():
+    for actor in _owned_actors(asub).values():
         label = actor.get_actor_label()
         if label and label.startswith(ACTOR_PREFIX):
             actors_map[label[len(ACTOR_PREFIX):]] = actor
@@ -1619,15 +1492,6 @@ def _update_textures_cmd(object_names=None, exchange_folder="",
     mat_dest = _mat_dir(scene_name)
 
     # Read material info JSON from exchange folder
-    mat_json = os.path.join(exchange_folder, "materials.json") if exchange_folder else ""
-    mat_entries = []
-    if mat_json and os.path.isfile(mat_json):
-        try:
-            with open(mat_json, "r") as f:
-                mat_entries = json.load(f)
-        except Exception as e:
-            _log(f"  Failed to read materials.json: {e}", "warning")
-
     tex_folder = os.path.join(exchange_folder, "textures") if exchange_folder else ""
     if not tex_folder or not os.path.isdir(tex_folder):
         _log("  No texture folder found", "warning")
@@ -1635,10 +1499,11 @@ def _update_textures_cmd(object_names=None, exchange_folder="",
 
     # Import texture files and build channel mapping
     imported_textures = {}  # {image_name: uefn_asset_path}
+    tex_folder = _exchange_path(tex_folder, directory=True)
     for fname in os.listdir(tex_folder):
-        if not fname.lower().endswith((".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tiff", ".exr")):
+        if not fname.lower().endswith(_TEXTURE_SUFFIXES):
             continue
-        fp = os.path.join(tex_folder, fname)
+        fp = _exchange_path(Path(tex_folder) / fname, _TEXTURE_SUFFIXES)
         aname = _sanitize_seg(f"T_{scene_name}_{os.path.splitext(fname)[0]}")
         ap = _import_tex(fp, tex_dest, aname)
         if ap:
@@ -1683,7 +1548,7 @@ def _update_textures_cmd(object_names=None, exchange_folder="",
             # Apply to actors
             asub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
             obj_set = set(object_names)
-            for actor in asub.get_all_level_actors():
+            for actor in _owned_actors(asub).values():
                 label = actor.get_actor_label()
                 if not label or not label.startswith(ACTOR_PREFIX):
                     continue
@@ -1708,19 +1573,18 @@ def _update_textures_cmd(object_names=None, exchange_folder="",
 # ============================================================
 
 def _read_bb_transforms():
-    """Read transforms of all BB_ actors in the level."""
+    """Read transforms only for actors owned by the connected Blender project."""
+    _check_world()
     asub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     result = []
-    for actor in asub.get_all_level_actors():
-        label = actor.get_actor_label()
-        if not label or not label.startswith(ACTOR_PREFIX):
-            continue
-        obj_name = label[len(ACTOR_PREFIX):]
+    for guid, actor in _owned_actors(asub).items():
+        obj_name = actor.get_actor_label().removeprefix(ACTOR_PREFIX)
         loc = actor.get_actor_location()
         rot = actor.get_actor_rotation()
         sc = actor.get_actor_scale3d()
         result.append({
             "name": obj_name,
+            "guid": guid,
             "location": [loc.x, loc.y, loc.z],
             "rotation": [rot.pitch, rot.yaw, rot.roll],
             "scale": [sc.x, sc.y, sc.z],
@@ -1750,8 +1614,7 @@ def _transform_hash(t):
 
 
 def _snapshot_transforms(transforms):
-    """Build a {name: hash} snapshot from a transform list."""
-    return {t["name"]: _transform_hash(t) for t in transforms}
+    return {t["guid"]: _transform_hash(t) for t in transforms}
 
 
 def _diff_transforms(transforms):
@@ -1760,8 +1623,8 @@ def _diff_transforms(transforms):
     new_snap = _snapshot_transforms(transforms)
     changed = []
     for t in transforms:
-        name = t["name"]
-        if new_snap[name] != _last_push_snapshot.get(name):
+        guid = t["guid"]
+        if new_snap[guid] != _last_push_snapshot.get(guid):
             changed.append(t)
     _last_push_snapshot = new_snap
     return changed
@@ -1771,7 +1634,7 @@ def _push_to_blender(port=0, transforms=None):
     """HTTP POST transforms to Blender's server."""
     if not port:
         port = _blender_server_port
-    if not port:
+    if not port or int(port) != _blender_server_port:
         _log("No Blender server port — cannot push", "warning")
         return False
     if not transforms:
@@ -1786,12 +1649,15 @@ def _push_to_blender(port=0, transforms=None):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Bridge-Token": _session_token},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        with _loopback_opener.open(req, timeout=10) as resp:
+            data = resp.read(MAX_REQUEST_BYTES + 1)
+            if len(data) > MAX_REQUEST_BYTES:
+                raise ValueError("Blender returned an oversized response.")
+            body = json.loads(data.decode("utf-8"))
             if body.get("success"):
                 _log(f"Pushed {len(transforms)} transform(s) to Blender")
                 return True
@@ -1820,10 +1686,10 @@ def _set_live_sync_cmd(active=False, blender_port=0, **kw):
     """Blender toggles Live Sync — when on, UEFN pushes actor edits back to Blender on each
     UEFN save (Ctrl+S). Carries Blender's server port so a toggle re-establishes it even after
     the UEFN script was re-run (which resets these globals). Baseline reset on enable."""
-    global _live_sync_active, _last_push_snapshot, _blender_server_port
+    global _live_sync_active, _last_push_snapshot
+    if blender_port and int(blender_port) != _blender_server_port:
+        raise ValueError("Reconnect Blender before changing its callback port.")
     _live_sync_active = bool(active)
-    if blender_port:
-        _blender_server_port = int(blender_port)
     if _live_sync_active:
         try:
             _last_push_snapshot = _snapshot_transforms(_read_bb_transforms())
@@ -1872,49 +1738,24 @@ def _push_transforms_to_blender_cmd(**kw):
     return {"pushed": len(transforms) if ok else 0}
 
 
-@_reg("clean_all")
-def _clean_all_cmd(**kw):
-    if not kw.get("confirm"):
-        return {"error": "clean_all requires confirm=True (destructive: deletes this project's "
-                         "BB_ actors + its BlenderBridge assets)"}
-    # SCOPED to THIS bridge project only: its actors (by folder) + its asset root
-    # /BlenderBridge/<project>. Never touches other projects or the rest of the level.
-    count = _cleanup_actors()
-    base = _base_dir()
-    try:
-        if _asset_lib().does_directory_exist(base):
-            _cleanup_assets(base)
-            _asset_lib().delete_directory(base)
-    except Exception as e:
-        _log(f"  asset cleanup error: {e}", "warning")
-    _imported_scenes.clear()
-    _log(f"Cleaned project '{_bridge_project}': {count} actor(s) + assets")
-    return {"cleaned": count, "project": _bridge_project}
-
-
-@_reg("execute_python")
-def _exec_py(code=""):
-    # Disabled by default — power-user/debug hook. Opt in with env BB_ENABLE_EXEC=1.
-    if os.environ.get("BB_ENABLE_EXEC") != "1":
-        return {"error": "execute_python is disabled (set BB_ENABLE_EXEC=1 to enable)"}
-    out, err = io.StringIO(), io.StringIO()
-    old = sys.stdout, sys.stderr
-    g = {"__builtins__": __builtins__, "unreal": unreal, "result": None}
-    try:
-        sys.stdout, sys.stderr = out, err
-        exec(code, g)
-    except Exception:
-        traceback.print_exc(file=err)
-    finally:
-        sys.stdout, sys.stderr = old
-    return {"result": _serialize(g.get("result")), "stdout": out.getvalue(), "stderr": err.getvalue()}
-
 # ============================================================
 # HTTP SERVER
 # ============================================================
 
 class _H(BaseHTTPRequestHandler):
+    def _allowed(self):
+        if self.path != "/" or self.headers.get("Origin") or self.headers.get("Sec-Fetch-Site"):
+            self._e(403, "This endpoint only accepts the local bridge client.")
+            return False
+        supplied = self.headers.get("X-Bridge-Token", "")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", supplied) or not hmac.compare_digest(supplied, _session_token):
+            self._e(401, "Bridge session token required.")
+            return False
+        return True
+
     def do_GET(self):
+        if not self._allowed():
+            return
         b = json.dumps({"status": "ok", "port": _bound_port}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1924,17 +1765,34 @@ class _H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _req_counter
-        L = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(L)
+        if not self._allowed():
+            return
+        if self.headers.get_content_type() != "application/json" or self.headers.get("Transfer-Encoding"):
+            self._e(415, "JSON body with Content-Length required.")
+            return
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            self._e(411, "Valid Content-Length required.")
+            return
+        length = int(lengths[0])
+        if not 0 < length <= MAX_REQUEST_BYTES:
+            self._e(413, "Bridge body exceeds the permitted request size.")
+            return
         try:
+            self.connection.settimeout(15)
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("Truncated body.")
             body = json.loads(raw)
-        except Exception:
+            if not isinstance(body, dict):
+                raise ValueError("Expected an object.")
+        except (ValueError, TimeoutError, UnicodeError):
             self._e(400, "Bad JSON")
             return
         cmd = body.get("command", "")
         par = body.get("params", {})
-        if not cmd:
-            self._e(400, "No command")
+        if not isinstance(cmd, str) or cmd not in _HANDLERS or not isinstance(par, dict):
+            self._e(400, "Unsupported bridge command or parameters.")
             return
         if cmd == "ping":
             b = json.dumps({"success": True, "result": {
@@ -1945,7 +1803,6 @@ class _H(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(b)))
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(b)
             return
@@ -1972,9 +1829,7 @@ class _H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_OPTIONS(self):
-        # No CORS — loopback-only; the legitimate client is Blender (urllib), not a browser.
-        self.send_response(204)
-        self.end_headers()
+        self._e(403, "Cross-origin requests are disabled.")
 
     def _e(self, c, m):
         b = json.dumps({"success": False, "error": m}).encode()
@@ -1994,10 +1849,6 @@ def _start_http():
         return _bound_port
     for p in range(DEFAULT_PORT, MAX_PORT + 1):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", p))
-            s.close()
             _http_server = HTTPServer(("127.0.0.1", p), _H)
             _bound_port = p
             _http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
@@ -2013,12 +1864,16 @@ def _stop_http():
     global _http_server, _http_thread, _bound_port
     if not _http_server:
         return
-    _http_server.shutdown()
-    if _http_thread:
-        _http_thread.join(timeout=3)
+    server = _http_server
     _http_server = None
     _http_thread = None
     _bound_port = 0
+    # Avoid blocking Slate while a request is waiting for the main-thread queue.
+    def close():
+        server.shutdown()
+        server.server_close()
+
+    threading.Thread(target=close, daemon=True).start()
 
 # ============================================================
 # TKINTER DASHBOARD
@@ -2148,9 +2003,7 @@ class Dashboard:
                  fg=self.DIM, bg=bg).pack(padx=16, anchor="w")
         ab = tk.Frame(self.root, bg=bg)
         ab.pack(fill="x", padx=16, pady=6)
-        self._btn(ab, "Clean All", self._clean, self.ACC)
         self._btn(ab, "Apply to Selected", self._apply, "#1f6feb")
-        self._btn(ab, "Reset", self._reset, self.BG3, fg=self.RED)
 
         # Sync actions
         sb = tk.Frame(self.root, bg=bg)
@@ -2244,11 +2097,8 @@ class Dashboard:
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
 
-    def _clean(self):
-        _command_queue.put((f"g_{time.time_ns()}", "clean_all", {}))
-        _log("Clean All requested")
-
     def _apply(self):
+        _check_world()
         if not _imported_scenes:
             _log("No imported scenes", "warning")
             return
@@ -2267,6 +2117,8 @@ class Dashboard:
         c = 0
         for a in actors:
             try:
+                if not _actor_guid(a):
+                    continue
                 comp = a.static_mesh_component
                 if comp:
                     for i in range(comp.get_num_materials()):
@@ -2275,14 +2127,6 @@ class Dashboard:
             except Exception:
                 pass
         _log(f"Applied to {c} actor(s)")
-
-    def _reset(self):
-        global _imported_scenes, _blender_info, _total_imports
-        _cleanup_actors()
-        _imported_scenes = {}
-        _blender_info = {}
-        _total_imports = 0
-        _log("Reset complete")
 
     def _push_bl(self):
         _command_queue.put((f"g_{time.time_ns()}", "push_transforms_to_blender", {}))
@@ -2452,6 +2296,25 @@ class Dashboard:
 # STARTUP
 # ============================================================
 
+def _stop_bridge():
+    global _gui
+    if _gui:
+        dashboard, _gui = _gui, None
+        dashboard._stop()
+        try:
+            if dashboard.root.winfo_exists():
+                dashboard.root.destroy()
+        except tk.TclError:
+            pass
+    else:
+        _stop_http()
+
+
+_load_session()
 _detect_project_path()
 port = _start_http()
-_gui = Dashboard(port)
+try:
+    _gui = Dashboard(port)
+except Exception:
+    _stop_http()
+    raise

@@ -1,41 +1,41 @@
 """UEFN Blender Bridge — Blender Side.
 
 Blender addon that exports FBX + textures to UEFN via HTTP bridge.
-Supports: full scene, selected objects, baked textures, live sync.
+Supports full scenes, selected objects, and save-triggered sync.
 
 Developed by KiKoZl (Surprise Co.)
 
 github.com/KiKoZl1 | Surprise Co. (surpriseugc.com)
 """
 
+from contextlib import contextmanager
 import bpy
 import hashlib
 import json
 import math
 import mathutils
 import os
+from pathlib import Path
 import queue as _queue_mod
+import re
 import struct
-import tempfile
 import threading
-import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import Request, urlopen
 from urllib.error import URLError
 from bpy.app.handlers import persistent
 
 from . import coords  # pure Blender<->UEFN convention (single source, unit-tested)
+from . import session
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-UEFN_HOST = "127.0.0.1"
 UEFN_PORT = 8790
 BLENDER_SERVER_PORT = 8791
 BLENDER_MAX_PORT = 8795
-EXCHANGE_DIR = os.path.join(tempfile.gettempdir(), "UEFNBlenderBridge")
+SERVER_TIMEOUT = 5.0
 ADDON_VERSION = "1.0.2"
 
 # ============================================================
@@ -45,18 +45,22 @@ ADDON_VERSION = "1.0.2"
 
 class BridgeState:
     connected = False
-    host = UEFN_HOST
     port = UEFN_PORT
     status = "Disconnected"
     last_error = ""            # last error message, surfaced in the panel until next action
     last_obj_hashes = {}       # {name: {"geo","mat","tex","trans"}}
-    last_object_names = set()  # set of obj names from last sync
-    last_send_time = 0.0
     live_active = False
     sending = False            # True while an async send is in flight (one at a time)
     send_count = 0
     project_path = ""
     project_name = ""          # bridge project name (folder in UEFN)
+    blend_path = None
+    token = ""
+    exchange = None
+    live_scene = None
+    synced_guids = frozenset()
+    generation = 0
+    pending_save = False
     # Bidirectional sync
     receiving = False          # True when applying inbound changes (suppresses outbound)
     server_port = 0            # Blender HTTP server port
@@ -84,47 +88,39 @@ def _err(m):
 # ============================================================
 
 
-def _url():
-    return f"http://{_st.host}:{_st.port}"
-
-
-def _send(cmd, params=None, timeout=120.0):
+def _send(cmd, params=None, timeout=120.0, endpoint=None):
     """Send command to UEFN bridge server."""
-    payload = json.dumps({"command": cmd, "params": params or {}}).encode()
-    req = Request(_url(), data=payload, headers={"Content-Type": "application/json"})
+    port, token = endpoint or (_st.port, _st.token)
     try:
-        with urlopen(req, timeout=timeout) as r:
-            body = json.loads(r.read().decode())
+        body = session.request(port, token, {"command": cmd, "params": params or {}}, timeout)
     except URLError as e:
         if "Connection refused" in str(e) or "No connection" in str(e):
             raise ConnectionError("UEFN not reachable") from e
         raise
-    if not body.get("success", False):
+    if body.get("success") is not True:
         raise RuntimeError(f"UEFN: {body.get('error', '?')}")
-    return body.get("result", {})
+    result = body.get("result", {})
+    if not isinstance(result, dict):
+        raise RuntimeError("UEFN returned an invalid bridge result.")
+    if result.get("error") or result.get("success") is False:
+        raise RuntimeError(f"UEFN: {result.get('error') or 'command failed'}")
+    return result
 
 
-def _send_async(cmd, params=None, label="Sent"):
-    """Run _send on a daemon thread so the Blender UI doesn't freeze while UEFN imports (the slow
-    part). ONLY the network call is threaded — no bpy is touched off the main thread. Status and
-    last_error are plain string assignments (GIL-atomic). One send in flight at a time (_st.sending;
-    the panel redraw is nudged by the _process_incoming timer on the main thread)."""
+def _send_async(cmd, params=None, label="Sent", snapshot=None):
+    """Keep asynchronous imports off Blender's main thread and apply acknowledgments there."""
     _st.sending = True
     _st.status = "Sending to UEFN..."
+    generation = _st.generation
+    endpoint = _st.port, _st.token
+    objects = params.get("objects", [])
 
     def _worker():
         try:
-            r = _send(cmd, params, timeout=600.0)
-            ac = r.get("actors", r.get("updated", r.get("added", 0)))
-            _st.status = f"{label}: {ac}"
-            _st.last_error = ""
-            _st.send_count += 1
-            _st.last_send_time = time.time()
+            result = _send(cmd, params, timeout=600.0, endpoint=endpoint)
+            _incoming_queue.put(("send_done", (generation, label, result, snapshot, objects)))
         except Exception as e:
-            _st.status = f"Send failed: {e}"
-            _err(f"Send error: {e}")
-        finally:
-            _st.sending = False
+            _incoming_queue.put(("send_failed", (generation, str(e))))
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -132,8 +128,7 @@ def _send_async(cmd, params=None, label="Sent"):
 def _alive():
     """Check if UEFN bridge is running."""
     try:
-        with urlopen(Request(_url()), timeout=5.0) as r:
-            return json.loads(r.read().decode()).get("status") == "ok"
+        return session.request(_st.port, _st.token).get("status") == "ok"
     except Exception:
         return False
 
@@ -142,29 +137,59 @@ def _alive():
 # ============================================================
 
 _incoming_queue = _queue_mod.Queue()
+_transform_queue = _queue_mod.Queue(maxsize=16)
 
 
 class _BlenderHTTPHandler(BaseHTTPRequestHandler):
     """Handle incoming commands from UEFN."""
 
+    def setup(self):
+        self.request.settimeout(SERVER_TIMEOUT)
+        super().setup()
+
+    def _allowed(self):
+        return self.path == "/" and session.is_authenticated(self.headers, _st.token)
+
     def do_GET(self):
+        if not self._allowed():
+            self._err(403, "Bridge authentication required")
+            return
         self._ok({"status": "ok", "port": _st.server_port})
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
+        if not self._allowed():
+            self._err(403, "Bridge authentication required")
+            return
+
         try:
-            body = json.loads(raw)
-        except Exception:
-            self._err(400, "Bad JSON")
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+                self._err(411, "Valid Content-Length required")
+                return
+            length = int(lengths[0])
+            if not 0 < length <= session.MAX_BODY:
+                self._err(413, "Invalid bridge request size")
+                return
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("Incomplete bridge request.")
+            body = session.decode_json(raw)
+        except (OSError, ValueError, RecursionError):
+            self._err(400, "Invalid bridge JSON")
             return
 
         cmd = body.get("command", "")
         params = body.get("params", {})
 
         if cmd == "push_transforms":
-            _incoming_queue.put(("push_transforms", params))
-            self._ok({"status": "queued"})
+            if not _st.connected or not isinstance(params, dict):
+                self._err(409, "No connected Blender file")
+                return
+            try:
+                _transform_queue.put_nowait((_st.generation, params))
+                self._ok({"status": "queued"})
+            except _queue_mod.Full:
+                self._err(429, "Blender is processing earlier transforms")
         elif cmd == "ping":
             self._ok({"status": "ok", "port": _st.server_port})
         else:
@@ -196,12 +221,7 @@ def _start_blender_server():
         return _st.server_port
     for p in range(BLENDER_SERVER_PORT, BLENDER_MAX_PORT + 1):
         try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", p))
-            s.close()
-            server = HTTPServer(("127.0.0.1", p), _BlenderHTTPHandler)
+            server = HTTPServer((session.HOST, p), _BlenderHTTPHandler)
             _st._http_server = server
             _st.server_port = p
             _st._http_thread = threading.Thread(
@@ -221,6 +241,7 @@ def _stop_blender_server():
         _st._http_server.shutdown()
         if _st._http_thread:
             _st._http_thread.join(timeout=3)
+        _st._http_server.server_close()
         _st._http_server = None
         _st._http_thread = None
         _st.server_port = 0
@@ -229,25 +250,31 @@ def _stop_blender_server():
 
 def _apply_incoming_transforms(params):
     """Apply transforms received from UEFN. Reverse mapping: UE → Blender."""
-    objects_data = params.get("objects", [])
-    if not objects_data:
+    objects_data = params.get("objects")
+    if not isinstance(objects_data, list) or not _connected_file():
         return
 
     _st.receiving = True
     try:
-        all_objs = {o.name: o for o in bpy.context.scene.objects
-                    if o.type == "MESH"}
+        all_objs = {}
+        for obj in bpy.context.scene.objects:
+            guid = obj.get("bb_guid")
+            if obj.type == "MESH" and isinstance(guid, str) and guid in _st.synced_guids:
+                all_objs[guid] = obj if guid not in all_objs else None
         updated = 0
 
         for od in objects_data:
-            name = od.get("name", "")
-            obj = all_objs.get(name)
-            if not obj:
+            if not isinstance(od, dict) or not isinstance(od.get("guid"), str):
+                continue
+            obj = all_objs.get(od["guid"])
+            if obj is None:
                 continue
 
-            ue_loc = od.get("location", [0, 0, 0])
-            ue_rot = od.get("rotation", [0, 0, 0])  # [Pitch, Yaw, Roll]
-            ue_scale = od.get("scale", [1, 1, 1])
+            ue_loc = od.get("location")
+            ue_rot = od.get("rotation")  # [Pitch, Yaw, Roll]
+            ue_scale = od.get("scale")
+            if not all(_valid_vector(v) for v in (ue_loc, ue_rot, ue_scale)):
+                continue
 
             # Reverse UE → Blender into a WORLD matrix (single-source convention).
             # matrix_world handles parenting (parent-inverse) and any rotation_mode
@@ -256,25 +283,60 @@ def _apply_incoming_transforms(params):
             eul = mathutils.Euler(coords.rot_ue_to_bl(*ue_rot), "XYZ")
             scl = mathutils.Vector((ue_scale[0], ue_scale[1], ue_scale[2]))
             obj.matrix_world = mathutils.Matrix.LocRotScale(loc, eul, scl)
+            if obj.name in _st.last_obj_hashes:
+                _st.last_obj_hashes[obj.name]["trans"] = _obj_transform_hash(obj)
             updated += 1
 
-        # Update snapshot to prevent re-sync loop
-        _st.last_obj_hashes = _snapshot_all()
-        _st.last_object_names = set(_st.last_obj_hashes.keys())
-        _log(f"Received {updated} transform(s) from UEFN")
-        _st.status = f"UEFN → Blender: {updated} updated"
+        if updated:
+            _log(f"Received {updated} transform(s) from UEFN")
+            _st.status = f"UEFN → Blender: {updated} updated"
 
     finally:
         _st.receiving = False
+
+
+def _valid_vector(vector):
+    return (isinstance(vector, list) and len(vector) == 3
+            and all(type(n) in (int, float) and -1e12 <= n <= 1e12 for n in vector))
 
 
 def _process_incoming():
     """Process incoming commands from UEFN (main thread timer)."""
     try:
         while not _incoming_queue.empty():
-            cmd, params = _incoming_queue.get_nowait()
-            if cmd == "push_transforms":
+            command, message = _incoming_queue.get_nowait()
+            generation, *data = message
+            if generation != _st.generation:
+                continue
+            _st.sending = False
+            if command == "send_failed":
+                _st.status = "Send failed"
+                _err(data[0])
+                continue
+            label, result, snapshot, objects = data
+            try:
+                _remember_actors(objects, result, "actors")
+            except RuntimeError as exc:
+                _st.status = "Send incomplete"
+                _err(str(exc))
+                continue
+            actors = result.get("actors", len(objects))
+            _st.status = f"{label}: {actors}"
+            _st.last_error = ""
+            _st.send_count += 1
+            if snapshot is not None:
+                _st.last_obj_hashes.update(snapshot)
+        for _ in range(4):
+            try:
+                generation, params = _transform_queue.get_nowait()
+            except _queue_mod.Empty:
+                break
+            if generation == _st.generation:
                 _apply_incoming_transforms(params)
+        if _st.pending_save and not _st.sending:
+            _st.pending_save = False
+            if _st.live_active:
+                _on_save()
     except Exception as e:
         _err(f"Incoming process error: {e}")
     # Redraw panels while an async send is in flight so its status updates show live (this runs
@@ -408,532 +470,103 @@ def _compute_diff(old_snap, new_snap):
 
     for name in old_names & new_names:
         old, new = old_snap[name], new_snap[name]
-        if old["geo"] != new["geo"]:
-            diff["geo_changed"].append(name)
-        elif old["mat"] != new["mat"]:
-            diff["mat_changed"].append(name)
-        elif old["tex"] != new["tex"]:
-            diff["tex_changed"].append(name)
-        elif old["trans"] != new["trans"]:
-            diff["trans_changed"].append(name)
+        for category in ("geo", "mat", "tex", "trans"):
+            if old.get(category) != new[category]:
+                diff[f"{category}_changed"].append(name)
 
     return diff
-
-# ============================================================
-# MATERIAL BACKUP / RESTORE
-# ============================================================
-
-
-def _backup_material(mat):
-    """Save material node tree state for later restoration."""
-    if not mat.use_nodes or not mat.node_tree:
-        return None
-
-    backup = {"nodes": [], "links": []}
-
-    for node in mat.node_tree.nodes:
-        nd = {
-            "bl_idname": node.bl_idname,
-            "name": node.name,
-            "location": (node.location.x, node.location.y),
-            "inputs": {},
-        }
-        for name, inp in node.inputs.items():
-            if hasattr(inp, "default_value"):
-                try:
-                    nd["inputs"][name] = (
-                        list(inp.default_value)
-                        if hasattr(inp.default_value, "__iter__")
-                        else inp.default_value
-                    )
-                except Exception:
-                    pass
-        if node.type == "TEX_IMAGE" and node.image:
-            nd["image"] = node.image.name
-            nd["colorspace"] = node.image.colorspace_settings.name
-        backup["nodes"].append(nd)
-
-    for link in mat.node_tree.links:
-        backup["links"].append({
-            "from_node": link.from_node.name,
-            "from_socket": link.from_socket.name,
-            "to_node": link.to_node.name,
-            "to_socket": link.to_socket.name,
-        })
-
-    return backup
-
-
-def _restore_material(mat, backup):
-    """Restore material from backup."""
-    tree = mat.node_tree
-    tree.nodes.clear()
-    nodes_map = {}
-
-    for nd in backup["nodes"]:
-        node = tree.nodes.new(nd["bl_idname"])
-        node.name = nd["name"]
-        node.location = nd["location"]
-        nodes_map[nd["name"]] = node
-
-        for name, val in nd["inputs"].items():
-            if name in node.inputs and hasattr(node.inputs[name], "default_value"):
-                try:
-                    if isinstance(val, list):
-                        for i in range(min(len(val), len(node.inputs[name].default_value))):
-                            node.inputs[name].default_value[i] = type(
-                                node.inputs[name].default_value[i])(val[i])
-                    else:
-                        node.inputs[name].default_value = type(
-                            node.inputs[name].default_value)(val)
-                except Exception:
-                    pass
-
-        if "image" in nd and nd["image"] in bpy.data.images:
-            node.image = bpy.data.images[nd["image"]]
-            if "colorspace" in nd:
-                node.image.colorspace_settings.name = nd["colorspace"]
-
-    for ld in backup["links"]:
-        try:
-            fn = nodes_map.get(ld["from_node"])
-            tn = nodes_map.get(ld["to_node"])
-            if fn and tn:
-                tree.links.new(fn.outputs[ld["from_socket"]],
-                               tn.inputs[ld["to_socket"]])
-        except Exception:
-            pass
-
-
-def _restore_baked(backups):
-    """Restore all baked materials."""
-    for mat_name, backup in backups.items():
-        if mat_name in bpy.data.materials:
-            _restore_material(bpy.data.materials[mat_name], backup)
-
-# ============================================================
-# BAKING
-# ============================================================
-
-
-def _simplify_material(mat, textures):
-    """Replace material with simple textured Principled BSDF."""
-    tree = mat.node_tree
-    tree.nodes.clear()
-
-    output = tree.nodes.new("ShaderNodeOutputMaterial")
-    output.location = (400, 0)
-    principled = tree.nodes.new("ShaderNodeBsdfPrincipled")
-    principled.location = (0, 0)
-    tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
-
-    x, y = -400, 300
-    for ch, filepath in textures.items():
-        img_name = os.path.basename(filepath)
-        img = bpy.data.images.get(img_name) or bpy.data.images.load(filepath)
-
-        tex = tree.nodes.new("ShaderNodeTexImage")
-        tex.image = img
-        tex.location = (x, y)
-
-        if ch == "base_color":
-            img.colorspace_settings.name = "sRGB"
-            tree.links.new(tex.outputs["Color"], principled.inputs["Base Color"])
-        elif ch == "roughness":
-            img.colorspace_settings.name = "Non-Color"
-            tree.links.new(tex.outputs["Color"], principled.inputs["Roughness"])
-        elif ch == "metallic":
-            img.colorspace_settings.name = "Non-Color"
-            tree.links.new(tex.outputs["Color"], principled.inputs["Metallic"])
-        elif ch == "normal":
-            img.colorspace_settings.name = "Non-Color"
-            nm = tree.nodes.new("ShaderNodeNormalMap")
-            nm.location = (x + 200, y)
-            tree.links.new(tex.outputs["Color"], nm.inputs["Color"])
-            tree.links.new(nm.outputs["Normal"], principled.inputs["Normal"])
-
-        y -= 300
-
-
-def _bake_channel(obj, mat, tree, principled, ch_name, bake_type,
-                  is_color, resolution, tex_dir):
-    """Bake a single channel. Returns file path or None."""
-    tex_name = f"{obj.name}_{mat.name}_{ch_name}".replace(" ", "_")
-    img = bpy.data.images.new(tex_name, resolution, resolution)
-    img.colorspace_settings.name = "sRGB" if is_color else "Non-Color"
-
-    img_node = tree.nodes.new("ShaderNodeTexImage")
-    img_node.image = img
-    tree.nodes.active = img_node
-
-    filepath = None
-    try:
-        if bake_type == "DIFFUSE":
-            bpy.context.scene.render.bake.use_pass_direct = False
-            bpy.context.scene.render.bake.use_pass_indirect = False
-            bpy.context.scene.render.bake.use_pass_color = True
-
-        if bake_type == "_METALLIC":
-            # Emission trick: route metallic value through emission for baking
-            output_node = None
-            for n in tree.nodes:
-                if n.type == "OUTPUT_MATERIAL":
-                    output_node = n
-                    break
-
-            if output_node and principled:
-                emit = tree.nodes.new("ShaderNodeEmission")
-                emit.name = "_bake_emit_tmp"
-
-                met_input = principled.inputs.get("Metallic")
-                if met_input and met_input.links:
-                    src = met_input.links[0].from_socket
-                    tree.links.new(src, emit.inputs["Color"])
-                else:
-                    val = met_input.default_value if met_input else 0.0
-                    emit.inputs["Color"].default_value = (val, val, val, 1.0)
-
-                old_link_src = None
-                for link in output_node.inputs["Surface"].links:
-                    old_link_src = link.from_socket
-                tree.links.new(emit.outputs["Emission"],
-                               output_node.inputs["Surface"])
-
-                bpy.ops.object.bake(type="EMIT")
-
-                tree.nodes.remove(emit)
-                if old_link_src:
-                    tree.links.new(old_link_src, output_node.inputs["Surface"])
-        else:
-            bpy.ops.object.bake(type=bake_type)
-
-        fp = os.path.join(tex_dir, f"{tex_name}.png")
-        img.filepath_raw = fp
-        img.file_format = "PNG"
-        img.save()
-        filepath = fp
-
-    except Exception as e:
-        _err(f"Bake {ch_name} failed for {obj.name}: {e}")
-
-    tree.nodes.remove(img_node)
-    bpy.data.images.remove(img)
-    return filepath
-
-
-def bake_and_simplify(target_objects, resolution=1024, bake_metallic=True):
-    """Bake textures from complex materials, simplify, return backups."""
-    tex_dir = os.path.join(EXCHANGE_DIR, "textures")
-    os.makedirs(tex_dir, exist_ok=True)
-
-    scene = bpy.context.scene
-    orig_engine = scene.render.engine
-    orig_active = bpy.context.view_layer.objects.active
-    orig_selected = [o for o in bpy.context.selected_objects]
-
-    backups = {}
-
-    channels = [
-        ("base_color", "DIFFUSE", True),
-        ("roughness", "ROUGHNESS", False),
-        ("normal", "NORMAL", False),
-    ]
-    if bake_metallic:
-        channels.append(("metallic", "_METALLIC", False))
-
-    try:
-        scene.render.engine = "CYCLES"
-        scene.cycles.samples = 1
-        scene.cycles.device = "CPU"
-
-        for obj in target_objects:
-            if obj.type != "MESH" or not obj.data.materials:
-                continue
-            if not obj.data.uv_layers:
-                _log(f"{obj.name}: no UVs, skipping bake")
-                continue
-
-            for mi, slot in enumerate(obj.material_slots):
-                mat = slot.material
-                if not mat or not mat.use_nodes:
-                    continue
-
-                tree = mat.node_tree
-                principled = None
-                for node in tree.nodes:
-                    if node.bl_idname == "ShaderNodeBsdfPrincipled":
-                        principled = node
-                        break
-                if not principled:
-                    continue
-
-                bc = principled.inputs.get("Base Color")
-                if not bc or not bc.links:
-                    continue
-
-                if mat.name not in backups:
-                    backups[mat.name] = _backup_material(mat)
-
-                for o in scene.objects:
-                    o.select_set(False)
-                obj.select_set(True)
-                bpy.context.view_layer.objects.active = obj
-                obj.active_material_index = mi
-
-                try:
-                    bpy.ops.object.mode_set(mode="EDIT")
-                    bpy.ops.mesh.select_all(action="SELECT")
-                    bpy.ops.uv.smart_project()
-                    bpy.ops.object.mode_set(mode="OBJECT")
-                except Exception:
-                    try:
-                        bpy.ops.object.mode_set(mode="OBJECT")
-                    except Exception:
-                        pass
-
-                textures = {}
-                for ch_name, bake_type, is_color in channels:
-                    fp = _bake_channel(
-                        obj, mat, tree, principled,
-                        ch_name, bake_type, is_color, resolution, tex_dir)
-                    if fp:
-                        textures[ch_name] = fp
-
-                if textures:
-                    _simplify_material(mat, textures)
-
-    finally:
-        scene.render.engine = orig_engine
-        for o in scene.objects:
-            o.select_set(o in set(orig_selected))
-        bpy.context.view_layer.objects.active = orig_active
-
-    return backups
 
 # ============================================================
 # EXCHANGE FOLDER + EXPORT
 # ============================================================
 
 
-def _clean_exchange():
-    """Clean exchange folder."""
-    os.makedirs(EXCHANGE_DIR, exist_ok=True)
-
-    tex_dir = os.path.join(EXCHANGE_DIR, "textures")
-    if os.path.isdir(tex_dir):
-        for f in os.listdir(tex_dir):
-            fp = os.path.join(tex_dir, f)
-            if os.path.isfile(fp):
-                try:
-                    os.remove(fp)
-                except Exception:
-                    pass
-
-    for f in os.listdir(EXCHANGE_DIR):
-        if f.endswith((".fbx", ".json")):
-            try:
-                os.remove(os.path.join(EXCHANGE_DIR, f))
-            except Exception:
-                pass
+def _safe_filename(name):
+    safe = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_")[:100] or "Asset"
+    if safe.upper() in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"(?:COM|LPT)[1-9]", safe.upper()):
+        return f"Asset_{safe}"
+    return safe
 
 
-def _export_textures():
-    """Export all textures used in scene materials to exchange folder."""
-    tex_dir = os.path.join(EXCHANGE_DIR, "textures")
-    os.makedirs(tex_dir, exist_ok=True)
+def _export_textures(objects, stage):
+    """Copy textures used by the outgoing meshes without modifying their images."""
+    tex_dir = stage / "textures"
+    tex_dir.mkdir()
     tex_paths = {}
-
-    for mat in bpy.data.materials:
-        if not mat.use_nodes or not mat.node_tree:
-            continue
-        for node in mat.node_tree.nodes:
-            if node.type == "TEX_IMAGE" and node.image:
-                img = node.image
-                name = img.name
-                fmt = img.file_format or "PNG"
-                ext = fmt.lower().replace("jpeg", "jpg")
-                filepath = os.path.join(tex_dir, f"{name}.{ext}")
-                # img.save() writes to filepath_raw, so we must point it at the exchange folder —
-                # but RESTORE the originals afterward. Permanently mutating the user's datablock
-                # would leave their textures pointing at the temp folder (wiped on the next send),
-                # breaking their .blend with pink/missing textures after a save. (Live Sync saves
-                # on Ctrl+S, so this fired constantly.)
-                orig_fp, orig_fmt = img.filepath_raw, img.file_format
-                try:
-                    img.filepath_raw = filepath
-                    img.file_format = fmt
-                    img.save()
-                except Exception:
-                    try:
-                        img.pack()
-                        img.save()
-                    except Exception:
-                        pass
-                finally:
-                    img.filepath_raw = orig_fp
-                    img.file_format = orig_fmt
-                tex_paths[name] = filepath
-
-    return tex_paths
-
-
-def _export_textures_for_objects(obj_names):
-    """Export textures used by specific objects only. Returns {image_name: path}."""
-    tex_dir = os.path.join(EXCHANGE_DIR, "textures")
-    os.makedirs(tex_dir, exist_ok=True)
-    tex_paths = {}
-    seen = set()
-
-    all_objs = {o.name: o for o in bpy.context.scene.objects if o.type == "MESH"}
-    for name in obj_names:
-        obj = all_objs.get(name)
-        if not obj or not hasattr(obj.data, "materials"):
-            continue
-        for mat in obj.data.materials:
+    extensions = {"BMP": "bmp", "JPEG": "jpg", "PNG": "png", "TARGA": "tga",
+                  "TARGA_RAW": "tga", "TIFF": "tiff", "OPEN_EXR": "exr", "HDR": "hdr"}
+    for obj in objects:
+        for slot in obj.material_slots:
+            mat = slot.material
             if not mat or not mat.use_nodes or not mat.node_tree:
                 continue
-            if mat.name in seen:
-                continue
-            seen.add(mat.name)
             for node in mat.node_tree.nodes:
-                if node.type == "TEX_IMAGE" and node.image:
-                    img = node.image
-                    img_name = img.name
-                    if img_name in tex_paths:
-                        continue
-                    fmt = img.file_format or "PNG"
-                    ext = fmt.lower().replace("jpeg", "jpg")
-                    filepath = os.path.join(tex_dir, f"{img_name}.{ext}")
-                    # Restore the datablock after saving (see _export_textures) — never leave the
-                    # user's image pointing at the temp exchange folder.
-                    orig_fp, orig_fmt = img.filepath_raw, img.file_format
+                img = node.image if node.type == "TEX_IMAGE" else None
+                if not img or img.name in tex_paths:
+                    continue
+                ext = extensions.get(img.file_format)
+                if not ext:
+                    _log(f"Skipping texture {img.name} with unsupported format {img.file_format}")
+                    continue
+                prefix = hashlib.sha256(img.name.encode("utf-8")).hexdigest()[:12]
+                safe_name = _safe_filename(os.path.splitext(img.name)[0])
+                filepath = tex_dir / f"T_{prefix}_{safe_name}.{ext}"
+                try:
+                    img.save(filepath=str(filepath), save_copy=True)
+                except TypeError:
+                    copy = img.copy()
                     try:
-                        img.filepath_raw = filepath
-                        img.file_format = fmt
-                        img.save()
-                    except Exception:
-                        try:
-                            img.pack()
-                            img.save()
-                        except Exception:
-                            pass
+                        copy.filepath_raw = str(filepath)
+                        copy.save()
                     finally:
-                        img.filepath_raw = orig_fp
-                        img.file_format = orig_fmt
-                    tex_paths[img_name] = filepath
-
+                        bpy.data.images.remove(copy)
+                if filepath.is_file():
+                    tex_paths[img.name] = str(filepath)
     return tex_paths
 
 
-def _export_material_info_for_objects(obj_names, tex_paths):
-    """Export material metadata JSON for specific objects. Returns path to JSON."""
-    materials = []
-    seen = set()
-
-    all_objs = {o.name: o for o in bpy.context.scene.objects if o.type == "MESH"}
-    for obj_name in obj_names:
-        obj = all_objs.get(obj_name)
-        if not obj:
-            continue
+def _export_material_info(objects, tex_paths, stage):
+    """Write one material record per Blender material used by the outgoing meshes."""
+    materials = {}
+    for obj in objects:
         for slot in obj.material_slots:
             mat = slot.material
-            if not mat:
+            if not mat or mat.name in materials:
                 continue
-            mat_key = f"{obj_name}:{mat.name}"
-            if mat_key in seen:
-                continue
-            seen.add(mat_key)
-
-            mat_info = {
-                "object_name": obj_name,
+            info = {
                 "name": mat.name,
-                "textures": {},
-            }
-
-            if mat.use_nodes and mat.node_tree:
-                for node in mat.node_tree.nodes:
-                    if node.type == "TEX_IMAGE" and node.image:
-                        for out in node.outputs:
-                            for link in out.links:
-                                socket_name = link.to_socket.name.lower()
-                                mat_info["textures"][socket_name] = {
-                                    "name": node.image.name,
-                                    "path": tex_paths.get(node.image.name, ""),
-                                    "colorspace": node.image.colorspace_settings.name,
-                                }
-
-            materials.append(mat_info)
-
-    mat_json = os.path.join(EXCHANGE_DIR, "materials.json")
-    with open(mat_json, "w") as f:
-        json.dump(materials, f)
-    return mat_json
-
-
-def _export_material_info(tex_paths):
-    """Export material metadata to JSON."""
-    materials = []
-
-    for obj in bpy.context.scene.objects:
-        if obj.type != "MESH":
-            continue
-        for slot in obj.material_slots:
-            mat = slot.material
-            if not mat:
-                continue
-
-            mat_info = {
-                "name": mat.name,
+                "object_name": obj.name,
                 "diffuse_color": list(mat.diffuse_color),
                 "metallic": mat.metallic,
                 "roughness": mat.roughness,
                 "specular": mat.specular_intensity,
                 "textures": {},
             }
-
             if mat.use_nodes and mat.node_tree:
                 for node in mat.node_tree.nodes:
-                    if node.type == "TEX_IMAGE" and node.image:
+                    if node.type == "TEX_IMAGE" and node.image and node.image.name in tex_paths:
                         for out in node.outputs:
                             for link in out.links:
-                                socket_name = link.to_socket.name.lower()
-                                mat_info["textures"][socket_name] = {
+                                info["textures"][link.to_socket.name.lower()] = {
                                     "name": node.image.name,
-                                    "path": tex_paths.get(node.image.name, ""),
+                                    "path": tex_paths[node.image.name],
                                     "colorspace": node.image.colorspace_settings.name,
                                 }
-
                     if node.bl_idname == "ShaderNodeBsdfPrincipled":
-                        for name, inp in node.inputs.items():
-                            if hasattr(inp, "default_value"):
-                                try:
-                                    key = name.lower().replace(" ", "_")
-                                    if hasattr(inp.default_value, "__iter__"):
-                                        mat_info[key] = [
-                                            round(float(v), 4)
-                                            for v in inp.default_value
-                                        ]
-                                    else:
-                                        mat_info[key] = round(
-                                            float(inp.default_value), 4)
-                                except Exception:
-                                    pass
-
-            materials.append(mat_info)
-
-    mat_json = os.path.join(EXCHANGE_DIR, "materials.json")
-    with open(mat_json, "w") as f:
-        json.dump(materials, f)
-    return mat_json
+                        for socket in node.inputs:
+                            key = socket.name.lower().replace(" ", "_")
+                            if key not in ("base_color", "metallic", "roughness", "specular", "specular_ior_level"):
+                                continue
+                            value = socket.default_value
+                            info[key] = float(value) if isinstance(value, (float, int)) else list(value)
+            materials[mat.name] = info
+    with (stage / "materials.json").open("x", encoding="utf-8") as manifest:
+        json.dump(list(materials.values()), manifest, allow_nan=False)
 
 
-def _export_fbx(selected_only=False):
-    """Export FBX. selected_only=True exports current selection only."""
-    filepath = os.path.join(EXCHANGE_DIR, "scene.fbx")
-
-    if not selected_only:
-        for obj in bpy.context.scene.objects:
-            obj.select_set(obj.type == "MESH")
+def _export_fbx(stage):
+    """Export the selected meshes to the transfer directory."""
+    filepath = str(stage / "scene.fbx")
 
     if not any(obj.select_get() for obj in bpy.context.scene.objects):
         return None
@@ -1004,6 +637,8 @@ def _export_fbx(selected_only=False):
                         bake_space_transform=False,
                         mesh_smooth_type="FACE",
                         use_mesh_modifiers=True,
+                        object_types={"MESH"},
+                        bake_anim=False,
                         add_leaf_bones=False,
                         # Mesh-only FBX: textures travel via the separate texture export +
                         # materials.json, and UEFN no longer imports embedded materials — so
@@ -1011,15 +646,14 @@ def _export_fbx(selected_only=False):
                         path_mode="STRIP",
                         embed_textures=False,
                     )
-                _restore()
-                return filepath
+                return filepath if Path(filepath).is_file() else None
     finally:
         _restore()
 
     return None
 
 
-def _export_fbx_objects(obj_names):
+def _export_fbx_objects(obj_names, stage):
     """Export individual FBX files per object. Returns {obj_name: fbx_path}."""
     results = {}
     area_3d = None
@@ -1042,9 +676,9 @@ def _export_fbx_objects(obj_names):
         if not obj:
             continue
 
-        # Sanitize filename (dots/spaces to underscores)
-        safe_name = name.replace(".", "_").replace(" ", "_")
-        filepath = os.path.join(EXCHANGE_DIR, f"{safe_name}.fbx")
+        object_dir = stage / uuid.uuid4().hex
+        object_dir.mkdir()
+        filepath = str(object_dir / f"{_safe_filename(name)}.fbx")
 
         # Select only this object
         bpy.ops.object.select_all(action="DESELECT")
@@ -1073,12 +707,15 @@ def _export_fbx_objects(obj_names):
                     bake_space_transform=False,
                     mesh_smooth_type="FACE",
                     use_mesh_modifiers=True,
+                    object_types={"MESH"},
+                    bake_anim=False,
                     add_leaf_bones=False,
                     # Mesh-only FBX (see _export_fbx) — textures go via the separate export.
                     path_mode="STRIP",
                     embed_textures=False,
                 )
-            results[name] = filepath
+            if Path(filepath).is_file():
+                results[name] = filepath
         except Exception as e:
             _err(f"FBX export failed for {name}: {e}")
         finally:
@@ -1177,11 +814,12 @@ def _dedup_guids():
     for o in sorted((ob for ob in bpy.context.scene.objects if ob.type == "MESH"),
                     key=lambda x: x.name):
         g = o.get("bb_guid")
-        if g and g in seen:
+        if g is None:
+            continue
+        if not isinstance(g, str) or not session.GUID_PATTERN.fullmatch(g) or g in seen:
             g = uuid.uuid4().hex
             o["bb_guid"] = g
-        if g:
-            seen.add(g)
+        seen.add(g)
 
 
 def _lod_parse(name):
@@ -1318,6 +956,20 @@ def _blend_project_name():
     return os.path.splitext(os.path.basename(path))[0] if path else ""
 
 
+def _current_blend_path():
+    return Path(bpy.data.filepath).resolve() if bpy.data.filepath else None
+
+
+def _connected_file():
+    if not _st.connected:
+        return False
+    if _current_blend_path() != _st.blend_path:
+        do_disconnect(notify=False)
+        _st.status = "The Blender file changed. Reconnect to sync it."
+        return False
+    return True
+
+
 def do_connect():
     """Connect to UEFN bridge."""
     # The project IS the .blend file — its filename names the UEFN folder, fully automatic
@@ -1332,30 +984,28 @@ def do_connect():
 
     _st.last_error = ""
     _st.status = "Connecting..."
-    _log(f"Connecting to UEFN at {_url()}...")
-
-    # Start Blender HTTP server for bidirectional sync
-    if not _st.server_port:
-        _start_blender_server()
-
-    if not _alive():
-        _st.status = "UEFN not reachable"
-        _err("Cannot reach UEFN bridge.\n"
-             "  1. Open UEFN project\n"
-             "  2. Tools > Execute Python Script > uefn_blender_bridge.py\n"
-             "  3. Dashboard opens, then Connect here")
-        return False
 
     try:
+        _st.token, _st.exchange = session.read_session()
+        if not _alive():
+            raise ConnectionError("Cannot reach the authenticated UEFN bridge. Start its editor script first.")
+        if not _start_blender_server():
+            raise ConnectionError("No local Blender bridge port is available.")
         r = _send("blender_connect", {
             "blender_version": bpy.app.version_string,
             "addon_version": ADDON_VERSION,
             "project_name": pname,
             "server_port": _st.server_port,
         })
+        _st.blend_path = _current_blend_path()
+        _st.generation += 1
         _st.connected = True
         _st.project_path = r.get("project_path", "")
         _st.project_name = pname
+        guids = r.get("guids", [])
+        if isinstance(guids, list):
+            _st.synced_guids = frozenset(
+                guid for guid in guids if isinstance(guid, str) and session.GUID_PATTERN.fullmatch(guid))
         _st.status = "Connected"
         _log(f"Connected! Project: {_st.project_path} / {pname}")
 
@@ -1364,353 +1014,262 @@ def do_connect():
             bpy.app.timers.register(_process_incoming, first_interval=0.5,
                                     persistent=True)
 
-        # If Live Sync was already on (e.g. reconnecting after re-running the UEFN script),
-        # re-assert it so UEFN gets our port + live flag back.
-        if _st.live_active:
-            try:
-                _send("set_live_sync", {"active": True, "blender_port": _st.server_port})
-            except Exception:
-                pass
-
         return True
     except Exception as e:
+        do_disconnect(notify=False)
         _st.status = f"Failed: {e}"
         _err(f"Connect failed: {e}")
         return False
 
 
-def do_disconnect():
+def do_disconnect(notify=True):
     """Disconnect from UEFN bridge."""
     if _st.live_active:
-        do_stop_live()
-    if _st.connected:
+        do_stop_live(notify=notify)
+    if _st.connected and notify:
         try:
-            _send("blender_disconnect")
+            _send("blender_disconnect", timeout=3)
         except Exception:
             pass
     _st.connected = False
+    _st.generation += 1
     _st.status = "Disconnected"
     _st.project_path = ""
+    _st.project_name = ""
+    _st.blend_path = None
+    _st.token = ""
+    _st.exchange = None
+    _st.sending = False
+    _st.pending_save = False
+    _st.synced_guids = frozenset()
+    _st.last_obj_hashes = {}
     # Stop incoming timer
     if bpy.app.timers.is_registered(_process_incoming):
         bpy.app.timers.unregister(_process_incoming)
+    _stop_blender_server()
+    while not _transform_queue.empty():
+        try:
+            _transform_queue.get_nowait()
+        except _queue_mod.Empty:
+            break
     _log("Disconnected")
 
 
-def do_send_scene(is_live=False):
-    """Export full scene and send to UEFN."""
-    if not _st.connected:
+@contextmanager
+def _preserve_selection():
+    view_objects = bpy.context.view_layer.objects
+    active = view_objects.active
+    selected = list(bpy.context.selected_objects)
+    try:
+        yield
+    finally:
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        for obj in selected:
+            obj.select_set(True)
+        view_objects.active = active
+
+
+def _export_selection(objects, stage):
+    """Export just these objects and restore the user's selection afterward."""
+    with _preserve_selection():
+        for obj in bpy.context.selected_objects:
+            obj.select_set(False)
+        for obj in objects:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = objects[0]
+        return _export_fbx(stage)
+
+
+def _send_meshes(objects, selected_only):
+    if not _connected_file() or _st.sending:
         return False
-    if _st.sending:
-        _st.status = "Busy — a send is already in progress"
+    if bpy.context.mode != "OBJECT":
+        _err("Switch to Object Mode before sending meshes.")
+        return False
+    if not objects:
+        _err("There are no meshes to export.")
         return False
 
     _st.last_error = ""
-    _st.status = "Live sync..." if is_live else "Exporting..."
+    try:
+        _dedup_guids()
+        existing = [obj for obj in objects if _is_synced(obj)]
+        fresh = [obj for obj in objects if not _is_synced(obj)]
+        snapshot = _snapshot_all()
+        if existing:
+            payload = _sync_geometry(existing, "update_objects", "updated")
+            _remember_actors(payload, _send("update_transforms", {"objects": payload}), "updated")
+            _save_snapshot(snapshot, [obj.name for obj in existing], ("geo", "trans"))
+        if not fresh:
+            _st.status = f"Updated {len(existing)} meshes"
+            _st.send_count += 1
+            return True
 
-    # Capture world transforms BEFORE export (export may modify them)
-    objects = [o for o in bpy.context.scene.objects if o.type == "MESH"]
-    obj_payload = _obj_data(objects)
-
-    _clean_exchange()
-    tex_paths = _export_textures()
-    _export_material_info(tex_paths)
-    fbx_path = _export_fbx()
-
-    if not fbx_path:
-        _st.status = "No meshes to export"
+        stage = session.make_stage(_st.exchange)
+        payload = _obj_data(fresh)
+        _export_material_info(fresh, _export_textures(fresh, stage), stage)
+        fbx_path = _export_selection(fresh, stage)
+        if not fbx_path:
+            raise RuntimeError("Blender did not produce an FBX file.")
+        snapshot = {obj.name: snapshot[obj.name] for obj in fresh}
+        params = {
+            "fbx_path": fbx_path,
+            "scene_name": bpy.context.scene.name,
+            "object_count": len(payload),
+            "objects": payload,
+            "exchange_folder": str(stage),
+            "selected_only": selected_only,
+            "combine_meshes": bpy.context.scene.uefn_bridge.combine_meshes,
+        }
+        _send_async("import_scene", params, "Sent selected" if selected_only else "Sent", snapshot)
+        return True
+    except Exception as exc:
+        _st.status = "Send failed"
+        _err(str(exc))
         return False
 
-    combine = bpy.context.scene.uefn_bridge.combine_meshes
-    params = {
-        "fbx_path": fbx_path,
-        "scene_name": bpy.context.scene.name,
-        "object_count": len(objects),
-        "objects": obj_payload,
-        "exchange_folder": EXCHANGE_DIR,
-        "combine_meshes": combine,
-    }
 
-    # Snapshot the baseline NOW (main thread) — we're sending the current state. The HTTP send
-    # runs async so the UI doesn't freeze while UEFN imports.
-    _st.last_obj_hashes = _snapshot_all()
-    _st.last_object_names = set(_st.last_obj_hashes.keys())
-    _send_async("import_scene", params, "Live" if is_live else "Sent")
-    return True
+def do_send_scene():
+    objects = [obj for obj in bpy.context.view_layer.objects if obj.type == "MESH"]
+    return _send_meshes(objects, selected_only=False)
 
 
 def do_send_selected():
-    """Export selected objects and send to UEFN."""
-    if not _st.connected:
-        return False
-    if _st.sending:
-        _st.status = "Busy — a send is already in progress"
-        return False
+    return _send_meshes(_collect_selected_meshes(), selected_only=True)
 
-    selected = _collect_selected_meshes()
-    if not selected:
-        _st.status = "No mesh selected"
-        return False
 
-    _st.last_error = ""
-    _st.status = "Exporting selected..."
+def _save_snapshot(new_snapshot, names, categories):
+    for name in names:
+        old = _st.last_obj_hashes.setdefault(name, {})
+        for category in categories:
+            old[category] = new_snapshot[name][category]
 
-    # Capture world transforms BEFORE export (export may modify them)
-    obj_payload = _obj_data(selected)
 
-    # Scope textures + material metadata to the SELECTION (B4) — not the whole scene.
-    obj_names = [o.name for o in selected]
-    _clean_exchange()
-    tex_paths = _export_textures_for_objects(obj_names)
-    _export_material_info_for_objects(obj_names, tex_paths)
+def _remember_actors(payload, result, count_key):
+    acknowledged = result.get("guids")
+    if isinstance(acknowledged, list):
+        expected = {obj["guid"] for obj in payload}
+        guids = frozenset(guid for guid in acknowledged if isinstance(guid, str) and guid in expected)
+    elif result.get(count_key) == len(payload):
+        guids = frozenset(obj["guid"] for obj in payload)
+    else:
+        raise RuntimeError("UEFN reported a partial update. Save again to retry.")
+    _st.synced_guids |= guids
+    if len(guids) != len(payload):
+        raise RuntimeError("UEFN reported a partial update. Save again to retry.")
 
-    orig_mode = bpy.context.mode
-    if orig_mode != "OBJECT":
-        bpy.ops.object.mode_set(mode="OBJECT")
 
-    for obj in bpy.context.scene.objects:
-        obj.select_set(False)
-    for obj in selected:
-        obj.select_set(True)
-    bpy.context.view_layer.objects.active = selected[0]
+def _is_synced(obj):
+    guid = obj.get("bb_guid")
+    return isinstance(guid, str) and guid in _st.synced_guids
 
-    fbx_path = _export_fbx(selected_only=True)
-    if not fbx_path:
-        _st.status = "Export failed"
-        return False
 
-    combine = bpy.context.scene.uefn_bridge.combine_meshes
-    params = {
-        "fbx_path": fbx_path,
-        "scene_name": "_".join([o.name for o in selected]),
-        "object_count": len(selected),
-        "objects": obj_payload,
-        "exchange_folder": EXCHANGE_DIR,
-        "selected_only": True,
-        "combine_meshes": combine,
-    }
-
-    # Async HTTP send — UI stays responsive while UEFN imports.
-    _send_async("import_scene", params, "Sent selected")
-    return True
+def _sync_geometry(targets, command, count_key):
+    stage = session.make_stage(_st.exchange)
+    payload = _obj_data(targets)
+    with _preserve_selection():
+        fbx_paths = _export_fbx_objects([obj.name for obj in targets], stage)
+    if len(fbx_paths) != len(_mesh_rep_map(targets)):
+        raise RuntimeError("Blender could not export every changed mesh.")
+    if command == "add_objects":
+        _export_material_info(targets, _export_textures(targets, stage), stage)
+    result = _send(command, {
+        "fbx_paths": fbx_paths,
+        "objects": payload,
+        "scene_name": bpy.context.scene.name,
+        "exchange_folder": str(stage),
+    }, timeout=600)
+    _remember_actors(payload, result, count_key)
+    return payload
 
 
 def do_send_changes():
-    """Smart diff sync — detects what changed and syncs only that."""
-    if not _st.connected:
+    """Update changed geometry, textures, materials, and transforms."""
+    if not _connected_file():
         return False
     if _st.sending:
-        _st.status = "Busy — a send is already in progress"
+        _st.status = "Busy. A send is already in progress."
+        return False
+    if bpy.context.mode != "OBJECT":
+        _err("Switch to Object Mode before sending changes.")
         return False
 
-    new_snap = _snapshot_all()
-    diff = _compute_diff(_st.last_obj_hashes, new_snap)
-
-    has_changes = any([diff["added"], diff["removed"], diff["geo_changed"],
-                       diff["mat_changed"], diff["tex_changed"], diff["trans_changed"]])
-    if not has_changes:
-        _st.status = "No changes detected"
-        _log("No changes")
-        return False
-
-    all_objs = {o.name: o for o in bpy.context.scene.objects if o.type == "MESH"}
+    _dedup_guids()
+    new_snapshot = _snapshot_all()
+    diff = _compute_diff(_st.last_obj_hashes, new_snapshot)
     scene_name = bpy.context.scene.name
-    _clean_exchange()
-    success = True
-
+    objects = {obj.name: obj for obj in bpy.context.view_layer.objects if obj.type == "MESH"}
+    new_names = set(diff["added"])
+    geometry = new_names | set(diff["geo_changed"])
+    other_changes = set(diff["mat_changed"]) | set(diff["tex_changed"]) | set(diff["trans_changed"])
+    added = {name for name in (geometry | other_changes) & objects.keys()
+             if not _is_synced(objects[name])}
+    geometry -= added
+    changed = False
     try:
-        # Category 5: Removed objects
-        if diff["removed"]:
-            _log(f"Removing {len(diff['removed'])} object(s): {diff['removed']}")
-            _send("remove_objects", {"names": diff["removed"]})
+        for candidates, command, count_key in (
+            (added, "add_objects", "added"),
+            (geometry, "update_objects", "updated"),
+        ):
+            names = sorted(candidates & objects.keys())
+            if not names:
+                continue
+            targets = [objects[name] for name in names]
+            _sync_geometry(targets, command, count_key)
+            categories = ("geo", "mat", "tex", "trans") if command == "add_objects" else ("geo",)
+            _save_snapshot(new_snapshot, names, categories)
+            changed = True
 
-        # Category 5: Added objects
-        if diff["added"]:
-            added = [all_objs[n] for n in diff["added"] if n in all_objs]
-            obj_payload = _obj_data(added)
-            fbx_paths = _export_fbx_objects(diff["added"])
-            if fbx_paths:
-                _log(f"Adding {len(fbx_paths)} object(s)")
-                _send("add_objects", {
-                    "fbx_paths": fbx_paths,
-                    "objects": obj_payload,
-                    "scene_name": scene_name,
-                    "exchange_folder": EXCHANGE_DIR,
-                })
-
-        # Category 2: Geometry changed (FBX re-export per object)
-        if diff["geo_changed"]:
-            geo_objs = [all_objs[n] for n in diff["geo_changed"] if n in all_objs]
-            obj_payload = _obj_data(geo_objs)
-            fbx_paths = _export_fbx_objects(diff["geo_changed"])
-            if fbx_paths:
-                _log(f"Updating geometry for {len(fbx_paths)} object(s)")
-                _send("update_objects", {
-                    "fbx_paths": fbx_paths,
-                    "objects": obj_payload,
-                    "scene_name": scene_name,
-                    "exchange_folder": EXCHANGE_DIR,
-                })
-
-        # Category 4: Texture changed (no FBX — just texture files + material rebind)
-        if diff["tex_changed"]:
-            tex_paths = _export_textures_for_objects(diff["tex_changed"])
-            _export_material_info_for_objects(diff["tex_changed"], tex_paths)
-            _log(f"Updating textures for {len(diff['tex_changed'])} object(s)")
+        names = [name for name in diff["tex_changed"] if name in objects and name not in added]
+        if names:
+            targets = [objects[name] for name in names]
+            stage = session.make_stage(_st.exchange)
+            _export_material_info(targets, _export_textures(targets, stage), stage)
             _send("update_textures", {
-                "object_names": diff["tex_changed"],
-                "exchange_folder": EXCHANGE_DIR,
+                "objects": _obj_data(targets),
+                "object_names": names,
+                "exchange_folder": str(stage),
                 "scene_name": scene_name,
-            })
+            }, timeout=600)
+            _save_snapshot(new_snapshot, names, ("tex",))
+            changed = True
 
-        # Category 3: Material properties changed
-        if diff["mat_changed"]:
-            mat_objs = [all_objs[n] for n in diff["mat_changed"] if n in all_objs]
-            mat_data = _collect_material_data(mat_objs)
-            if mat_data:
-                _log(f"Updating materials for {len(diff['mat_changed'])} object(s)")
-                _send("update_materials", {"materials": mat_data})
+        names = [name for name in diff["mat_changed"] if name in objects and name not in added]
+        if names:
+            materials = _collect_material_data([objects[name] for name in names])
+            if materials:
+                _send("update_materials", {
+                    "materials": materials,
+                    "objects": _obj_data([objects[name] for name in names]),
+                })
+            _save_snapshot(new_snapshot, names, ("mat",))
+            changed = True
 
-        # Category 1: Transform only
-        if diff["trans_changed"]:
-            trans_objs = [all_objs[n] for n in diff["trans_changed"] if n in all_objs]
-            _log(f"Updating transforms for {len(diff['trans_changed'])} object(s)")
-            _send("update_transforms", {"objects": _obj_data(trans_objs)})
-
-    except Exception as e:
-        _st.status = f"Sync failed: {e}"
-        _err(f"Smart sync error: {e}")
-        success = False
-
-    # Update baseline snapshot
-    _st.last_obj_hashes = new_snap
-    _st.last_object_names = set(new_snap.keys())
-    _st.last_send_time = time.time()
-    _st.send_count += 1
-
-    # Build status message
-    parts = []
-    if diff["added"]: parts.append(f"+{len(diff['added'])}")
-    if diff["removed"]: parts.append(f"-{len(diff['removed'])}")
-    if diff["geo_changed"]: parts.append(f"geo:{len(diff['geo_changed'])}")
-    if diff["mat_changed"]: parts.append(f"mat:{len(diff['mat_changed'])}")
-    if diff["tex_changed"]: parts.append(f"tex:{len(diff['tex_changed'])}")
-    if diff["trans_changed"]: parts.append(f"pos:{len(diff['trans_changed'])}")
-    _st.status = f"Synced: {', '.join(parts)}"
-    _log(f"Smart sync: {', '.join(parts)}")
-    return success
-
-
-def do_update_transforms():
-    """Send only transform updates (no FBX re-export)."""
-    if not _st.connected:
+        names = [name for name in diff["trans_changed"] if name in objects and name not in added]
+        if names:
+            payload = _obj_data([objects[name] for name in names])
+            result = _send("update_transforms", {"objects": payload})
+            _remember_actors(payload, result, "updated")
+            _save_snapshot(new_snapshot, names, ("trans",))
+            changed = True
+    except Exception as exc:
+        _st.status = "Sync failed"
+        _err(str(exc))
         return False
 
-    objects = [o for o in bpy.context.scene.objects if o.type == "MESH"]
-    try:
-        r = _send("update_transforms", {"objects": _obj_data(objects)})
-        _st.last_obj_hashes = _snapshot_all()
-        _st.last_object_names = set(_st.last_obj_hashes.keys())
-        _st.last_send_time = time.time()
-        u = r.get("updated", 0)
-        _st.status = f"Transforms: {u} updated"
-        _log(f"Transforms updated: {u}")
-        return True
-    except Exception as e:
-        _st.status = f"Transform failed: {e}"
-        _err(f"Transform update error: {e}")
-        return False
-
-
-def do_bake_and_send(selected_only=False):
-    """Bake textures, export, and send to UEFN."""
-    if not _st.connected:
-        return False
-
-    if selected_only:
-        targets = _collect_selected_meshes()
-        if not targets:
-            _st.status = "No mesh selected"
-            return False
-    else:
-        targets = [o for o in bpy.context.scene.objects if o.type == "MESH"]
-
-    if not targets:
-        _st.status = "No meshes"
-        return False
-
-    _st.status = "Baking..."
-    _clean_exchange()
-
-    try:
-        props = bpy.context.scene.uefn_bridge
-        resolution = props.bake_resolution
-        bake_met = props.bake_metallic
-    except Exception:
-        resolution = 1024
-        bake_met = True
-
-    try:
-        backups = bake_and_simplify(targets, resolution, bake_met)
-    except Exception as e:
-        _err(f"Bake error: {e}")
-        backups = {}
-
-    _export_textures()
-
-    if selected_only:
-        for obj in bpy.context.scene.objects:
-            obj.select_set(False)
-        for obj in targets:
-            obj.select_set(True)
-        bpy.context.view_layer.objects.active = targets[0]
-        fbx_path = _export_fbx(selected_only=True)
-    else:
-        fbx_path = _export_fbx()
-
-    if backups:
-        _restore_baked(backups)
-
-    if not fbx_path:
-        _st.status = "Export failed"
-        return False
-
-    combine = bpy.context.scene.uefn_bridge.combine_meshes
-    params = {
-        "fbx_path": fbx_path,
-        "scene_name": bpy.context.scene.name,
-        "object_count": len(targets),
-        "objects": _obj_data(targets),
-        "exchange_folder": EXCHANGE_DIR,
-        "combine_meshes": combine,
-    }
-
-    try:
-        r = _send("import_baked", params)
+    for name in diff["removed"]:
+        _st.last_obj_hashes.pop(name, None)
+    if changed:
+        _st.status = "Changes sent to UEFN"
+        _st.last_error = ""
         _st.send_count += 1
-        ac = r.get("actors", 0)
-        _st.status = f"Baked: {ac} actors"
-        _log(f"Baked & sent: {ac} actors, {r.get('materials', 0)} materials")
-        return True
-    except Exception as e:
-        _st.status = f"Bake send failed: {e}"
-        _err(f"Bake send error: {e}")
-        return False
+    elif diff["removed"]:
+        _st.status = "Removed Blender objects were kept in UEFN"
+    else:
+        _st.status = "No changes detected"
+    return changed
 
-
-def do_clean_all():
-    """Request UEFN to clean all imported assets."""
-    if not _st.connected:
-        return False
-    try:
-        r = _send("clean_all", {"confirm": True})
-        c = r.get("cleaned", 0)
-        _st.status = f"Cleaned {c} actors"
-        _log(f"Clean all: {c} actors")
-        return True
-    except Exception as e:
-        _st.status = f"Clean failed: {e}"
-        return False
 
 # ============================================================
 # LIVE SYNC (triggers on Ctrl+S)
@@ -1718,9 +1277,21 @@ def do_clean_all():
 
 
 @persistent
-def _on_save(dummy):
+def _on_load(*_args):
+    if _st.connected:
+        do_disconnect(notify=False)
+
+
+@persistent
+def _on_save(*_args):
     """Called after every Ctrl+S — syncs to UEFN if live mode is active."""
-    if not _st.live_active or not _st.connected:
+    if not _st.live_active or not _connected_file():
+        return
+    if bpy.context.scene.name != _st.live_scene:
+        _st.status = "Return to the scene where live sync started."
+        return
+    if _st.sending:
+        _st.pending_save = True
         return
     # Don't sync back when applying inbound changes from UEFN
     if _st.receiving:
@@ -1739,32 +1310,36 @@ def _on_save(dummy):
 
 def do_start_live():
     """Start live sync — auto-syncs on every Ctrl+S."""
-    if _st.live_active:
-        return
+    if _st.live_active or not _connected_file():
+        return False
+    try:
+        _send("set_live_sync", {"active": True, "blender_port": _st.server_port}, timeout=5)
+    except Exception as e:
+        _err(f"Could not start live sync: {e}")
+        return False
     _st.live_active = True
-    _st.last_obj_hashes = _snapshot_all()
-    _st.last_object_names = set(_st.last_obj_hashes.keys())
+    _st.live_scene = bpy.context.scene.name
+    for name, value in _snapshot_all().items():
+        _st.last_obj_hashes.setdefault(name, value)
     if _on_save not in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.append(_on_save)
-    # Tell UEFN to start pushing actor edits back to us (bidirectional live sync). Send our
-    # server port too, so this re-establishes it even if the UEFN script was re-run.
-    try:
-        _send("set_live_sync", {"active": True, "blender_port": _st.server_port})
-    except Exception as e:
-        _err(f"Could not enable UEFN->Blender live sync: {e}")
     _st.status = "Live: Blender⇄UEFN"
     _log("Live sync started (Blender→UEFN on save; UEFN→Blender live)")
+    return True
 
 
-def do_stop_live():
+def do_stop_live(notify=True):
     """Stop live sync."""
     _st.live_active = False
+    _st.live_scene = None
+    _st.pending_save = False
     if _on_save in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.remove(_on_save)
-    try:
-        _send("set_live_sync", {"active": False})
-    except Exception:
-        pass
+    if notify:
+        try:
+            _send("set_live_sync", {"active": False}, timeout=3)
+        except Exception:
+            pass
     _st.status = "Connected"
     _log("Live sync stopped")
 
@@ -1780,7 +1355,6 @@ class UEFNBRIDGE_OT_connect(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.uefn_bridge
-        _st.host = props.host
         _st.port = props.port
         if do_connect():
             self.report({"INFO"}, f"Connected to UEFN ({_st.project_path})")
@@ -1848,40 +1422,6 @@ class UEFNBRIDGE_OT_send_selected(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class UEFNBRIDGE_OT_bake_scene(bpy.types.Operator):
-    bl_idname = "uefn_bridge.bake_scene"
-    bl_label = "Bake & Send Scene"
-    bl_description = "Bake textures from materials, simplify, and send"
-
-    @classmethod
-    def poll(cls, context):
-        return _st.connected
-
-    def execute(self, context):
-        if do_bake_and_send(selected_only=False):
-            self.report({"INFO"}, _st.status)
-        else:
-            self.report({"WARNING"}, _st.status)
-        return {"FINISHED"}
-
-
-class UEFNBRIDGE_OT_bake_selected(bpy.types.Operator):
-    bl_idname = "uefn_bridge.bake_selected"
-    bl_label = "Bake & Send Selected"
-    bl_description = "Bake textures and send only selected objects"
-
-    @classmethod
-    def poll(cls, context):
-        return _st.connected and len(context.selected_objects) > 0
-
-    def execute(self, context):
-        if do_bake_and_send(selected_only=True):
-            self.report({"INFO"}, _st.status)
-        else:
-            self.report({"WARNING"}, _st.status)
-        return {"FINISHED"}
-
-
 class UEFNBRIDGE_OT_start_live(bpy.types.Operator):
     bl_idname = "uefn_bridge.start_live"
     bl_label = "Start Live Sync"
@@ -1905,26 +1445,6 @@ class UEFNBRIDGE_OT_stop_live(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class UEFNBRIDGE_OT_clean(bpy.types.Operator):
-    bl_idname = "uefn_bridge.clean"
-    bl_label = "Clean THIS Project in UEFN"
-    bl_description = ("Remove THIS project's bridge actors + its BlenderBridge/<project> assets "
-                     "from UEFN. Scoped to this .blend — never touches other projects")
-
-    @classmethod
-    def poll(cls, context):
-        return _st.connected
-
-    def invoke(self, context, event):
-        # Destructive (hard-deletes THIS project's BB_ actors + assets) — confirm first.
-        return context.window_manager.invoke_confirm(self, event)
-
-    def execute(self, context):
-        do_clean_all()
-        self.report({"INFO"}, _st.status)
-        return {"FINISHED"}
-
-
 class UEFNBRIDGE_OT_pull_transforms(bpy.types.Operator):
     bl_idname = "uefn_bridge.pull_transforms"
     bl_label = "Pull Transforms from UEFN"
@@ -1945,28 +1465,8 @@ class UEFNBRIDGE_OT_pull_transforms(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class UEFNBRIDGE_OT_open_url(bpy.types.Operator):
-    bl_idname = "uefn_bridge.open_url"
-    bl_label = "Open URL"
-    url: bpy.props.StringProperty()
-
-    def execute(self, context):
-        import webbrowser
-        webbrowser.open(self.url)
-        return {"FINISHED"}
-
-# ============================================================
-# PROPERTIES
-# ============================================================
-
-
 class UEFNBridgeProperties(bpy.types.PropertyGroup):
     # No project_name field — the project is the .blend filename, fully automatic.
-    host: bpy.props.StringProperty(
-        name="Host",
-        default="127.0.0.1",
-        description="UEFN bridge server address",
-    )
     port: bpy.props.IntProperty(
         name="Port",
         default=8790,
@@ -1974,30 +1474,12 @@ class UEFNBridgeProperties(bpy.types.PropertyGroup):
         max=65535,
         description="UEFN bridge server port",
     )
-    bake_resolution: bpy.props.IntProperty(
-        name="Resolution",
-        default=1024,
-        min=128,
-        max=4096,
-        description="Bake texture resolution",
-    )
-    bake_metallic: bpy.props.BoolProperty(
-        name="Bake Metallic",
-        default=True,
-        description="Include metallic channel in bake (uses emission trick)",
-    )
     combine_meshes: bpy.props.BoolProperty(
         name="Combine Meshes",
         default=False,
         description="Merge the selection into ONE static mesh on import. Off (default) "
                     "keeps objects separate so each lands at its own Blender position.",
     )
-    auto_apply_transforms: bpy.props.BoolProperty(
-        name="Apply Rotation & Scale",
-        default=True,
-        description="Automatically apply rotation and scale before export to avoid transform issues",
-    )
-
 # ============================================================
 # N-PANEL (collapsible sub-panels)
 # ============================================================
@@ -2071,7 +1553,6 @@ class UEFNBRIDGE_PT_connection(bpy.types.Panel):
             else:
                 layout.label(text="Save the .blend to name the project", icon="ERROR")
             layout.separator()
-            layout.prop(props, "host")
             layout.prop(props, "port")
             layout.operator("uefn_bridge.connect", icon="PLAY")
         else:
@@ -2093,42 +1574,11 @@ class UEFNBRIDGE_PT_export(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.uefn_bridge
-        layout.prop(props, "auto_apply_transforms")
         layout.prop(props, "combine_meshes")
         layout.separator()
         layout.operator("uefn_bridge.send_scene", icon="SCENE_DATA")
         layout.operator("uefn_bridge.send_changes", icon="FILE_REFRESH")
         layout.operator("uefn_bridge.send_selected", icon="RESTRICT_SELECT_OFF")
-        layout.separator()
-        layout.operator("uefn_bridge.clean", icon="TRASH")
-
-
-class UEFNBRIDGE_PT_bake(bpy.types.Panel):
-    bl_label = "Bake & Send"
-    bl_idname = "UEFNBRIDGE_PT_bake"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "UEFN"
-    bl_parent_id = "UEFNBRIDGE_PT_main"
-    bl_options = {"DEFAULT_CLOSED"}
-
-    @classmethod
-    def poll(cls, context):
-        return _st.connected
-
-    def draw(self, context):
-        layout = self.layout
-        props = context.scene.uefn_bridge
-
-        layout.prop(props, "bake_resolution")
-        layout.prop(props, "bake_metallic")
-        layout.separator()
-        layout.operator("uefn_bridge.bake_scene", icon="RENDER_STILL")
-        layout.operator("uefn_bridge.bake_selected", icon="RESTRICT_SELECT_OFF")
-
-        box = layout.box()
-        box.label(text="Bake uses Cycles (CPU, 1 sample)", icon="INFO")
-        box.label(text="Materials are temporarily modified")
 
 
 class UEFNBRIDGE_PT_live(bpy.types.Panel):
@@ -2176,12 +1626,6 @@ class UEFNBRIDGE_PT_info(bpy.types.Panel):
         layout.label(text=f"UEFN Blender Bridge v{ADDON_VERSION}")
         layout.label(text="by KiKoZl - Surprise Co.")
 
-        op = layout.operator("uefn_bridge.open_url", text="GitHub", icon="URL")
-        op.url = "https://github.com/KiKoZl1"
-
-        layout.separator()
-        layout.label(text="")
-        layout.label(text="Built for UEFN by KiKoZl")
 
 # ============================================================
 # REGISTER
@@ -2194,19 +1638,12 @@ _classes = (
     UEFNBRIDGE_OT_send_scene,
     UEFNBRIDGE_OT_send_changes,
     UEFNBRIDGE_OT_send_selected,
-    UEFNBRIDGE_OT_bake_scene,
-    UEFNBRIDGE_OT_bake_selected,
     UEFNBRIDGE_OT_start_live,
     UEFNBRIDGE_OT_stop_live,
-    UEFNBRIDGE_OT_clean,
     UEFNBRIDGE_OT_pull_transforms,
-    UEFNBRIDGE_OT_open_url,
     UEFNBRIDGE_PT_main,
     UEFNBRIDGE_PT_connection,
     UEFNBRIDGE_PT_export,
-    # UEFNBRIDGE_PT_bake,   # HIDDEN for v1.0.2: the baked import path doesn't apply materials yet
-    #                       (baked actors land untextured) — re-enable once the UEFN side wires
-    #                       _apply_materials into _import_baked_cmd. Operators stay registered.
     UEFNBRIDGE_PT_live,
     UEFNBRIDGE_PT_info,
 )
@@ -2217,18 +1654,15 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.uefn_bridge = bpy.props.PointerProperty(
         type=UEFNBridgeProperties)
-    os.makedirs(EXCHANGE_DIR, exist_ok=True)
+    if _on_load not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_on_load)
     _log("UEFN Bridge addon registered")
 
 
 def unregister():
-    if bpy.app.timers.is_registered(_process_incoming):
-        bpy.app.timers.unregister(_process_incoming)
-    _stop_blender_server()
-    if _st.live_active:
-        do_stop_live()
-    if _st.connected:
-        do_disconnect()
+    if _on_load in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_on_load)
+    do_disconnect()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     if hasattr(bpy.types.Scene, "uefn_bridge"):

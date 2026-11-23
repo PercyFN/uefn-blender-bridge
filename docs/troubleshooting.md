@@ -1,5 +1,7 @@
 # Troubleshooting
 
+For the authenticated fork, first verify both editors use the same [local session directory](local-session.md). The notes below describe upstream behavior. The fork uses loopback on the existing local ports and needs no firewall exception or project auto-start configuration.
+
 Common issues and how to fix them. If your problem isn't here, please
 [open an issue](https://github.com/KiKoZl1/uefn-blender-bridge/issues) with:
 - Blender version, UEFN version, OS

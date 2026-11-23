@@ -2,7 +2,7 @@
 
 > The only Blender ↔ UEFN bridge with real two-way live sync. Build in Blender, see it in UEFN — and back again — on every save.
 
-**Status:** `v1.0.2` — stable. See [CHANGELOG.md](CHANGELOG.md).
+**Fork:** Based on upstream `v1.0.2`. See [local session setup](docs/local-session.md) for the authenticated branch and its scope.
 **License:** [MIT](LICENSE)
 **Made by:** [KiKoZl](https://github.com/KiKoZl1) · [Surprise Co.](https://surpriseugc.com)
 
@@ -47,8 +47,7 @@ machine.
   material), `T_` (texture). The source name is always preserved.
 - **Auto-collision and Nanite** applied on import.
 - **Stable identity.** A per-object GUID survives rename and duplicate.
-- **Scoped safety.** "Clean All" affects only the **current** project and asks
-  for confirmation; destructive operations are gated.
+- **Scoped updates.** Each session is bound to the open UEFN level and the connected `.blend` file. The bridge updates linked actors by ID and reimports geometry into the existing mesh package. Remove obsolete actors and assets in the editor.
 - **Quality of life.** Async non-blocking sends and in-panel error surfacing.
 
 ---
@@ -70,8 +69,9 @@ machine.
 
 ## Install
 
-Get the latest [GitHub release](https://github.com/KiKoZl1/uefn-blender-bridge/releases/latest)
-or clone this repo. Installation has two parts.
+Use the Blender add-on and UEFN script from the same checkout of this branch.
+Create the shared private session described in [local session setup](docs/local-session.md)
+before starting either side. Installation has two parts.
 
 ### 1. The Blender add-on
 
@@ -96,8 +96,7 @@ or clone this repo. Installation has two parts.
 3. Run it via `Tools > Execute Python Script...` and pick the file. The Bridge
    Dashboard window opens.
 
-> Make sure the **Python Editor Script Plugin** is enabled in `Edit > Plugins`.
-> To auto-run the script on startup, see [docs/installation.md](docs/installation.md).
+> Start the bridge explicitly for the intended UEFN level. See [local session setup](docs/local-session.md).
 
 ---
 
